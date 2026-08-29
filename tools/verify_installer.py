@@ -122,8 +122,8 @@ async def main() -> int:
             check(bool(result.exact_matches),
                   f"搜到 {len(result.exact_matches)} 条结果")
             for match in result.exact_matches[:3]:
-                print(f"        url: {match.url[:90]}")
-                print(f"        content: {match.content[:60]}")
+                print(f"        链接: {match.url[:90]}")
+                print(f"        标题: {match.content[:60]}")
         finally:
             await searcher.close()
         return 0 if not failures else 1

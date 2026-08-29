@@ -99,7 +99,7 @@ def build_config(raw: Mapping[str, Any] | None,
     output_raw = _section(raw, "output")
     limits_raw = _section(raw, "limits")
 
-    max_results = _int(search_raw.get("max_results"), 5, minimum=1, maximum=50)
+    max_results = _int(search_raw.get("max_results"), 10, minimum=1, maximum=50)
     root = pathlib.Path(data_dir) if data_dir else None
     profile_root = (root / "browser_profile") if root else None
     install_root = (root / "ms-playwright") if root else None

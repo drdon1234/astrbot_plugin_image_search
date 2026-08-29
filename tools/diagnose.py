@@ -157,9 +157,9 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
         print("\n前 5 条结果：")
         resolved = await _build(browser, items, exact_url)
         for m in resolved[:5]:
-            print(f"  url: {m.url}")
-            print(f"  content: {m.content}")
-            print(f"  source: {m.source}  {m.width}x{m.height}")
+            print(f"  链接: {m.url}")
+            print(f"  标题: {m.content}")
+            print(f"  来源: {m.source}  {m.width}x{m.height}")
             print()
         return 0 if resolved else 2
     finally:

@@ -6,8 +6,8 @@
             "max_results": {
                 "description": "最多返回条数",
                 "type": "int",
-                "hint": "Google 一页通常给 20 条以上；机器人场景建议 3~8 条，太多会刷屏。",
-                "default": 5
+                "hint": "Google 一页通常给 20 条以上。条数越多消息越长，按需调整。",
+                "default": 10
             },
             "hl": {
                 "description": "结果页语言",

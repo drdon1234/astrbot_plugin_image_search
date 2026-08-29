@@ -39,8 +39,8 @@ class ExactMatch:
         return dataclasses.asdict(self)
 
     def format(self) -> str:
-        """按用户期望的 ``url: ... / content: ...`` 形式格式化。"""
-        return f"url: {self.url}\ncontent: {self.content}"
+        """按 ``链接: ... / 标题: ...`` 形式格式化。"""
+        return f"链接: {self.url}\n标题: {self.content}"
 
 
 @dataclasses.dataclass(slots=True)
@@ -68,7 +68,7 @@ class LensSearchResult:
             "exact_matches": [m.to_dict() for m in self.exact_matches],
         }
 
-    def format(self, limit: int = 5) -> str:
+    def format(self, limit: int = 10) -> str:
         if not self.exact_matches:
             return "未找到完全匹配的结果"
         blocks = [m.format() for m in self.exact_matches[:limit]]

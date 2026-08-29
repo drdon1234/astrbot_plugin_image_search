@@ -26,7 +26,7 @@ IMAGE = "test_imgs/test.png"
 MODE = "search"
 
 #: 最多返回几条结果
-LIMIT = 5
+LIMIT = 10
 
 #: 结果页语言，影响标题和站点名的语言，不影响匹配结果
 HL = "en"

@@ -20,29 +20,29 @@ class OutputOptions:
         show_size: 是否输出图片尺寸。
         show_index: 是否给每条加序号。
         show_ocr: 是否附上 OCR 文字。
-        header: 结果前面的抬头，``{count}`` 会替换成条数。
+        header: 结果前面的抬头。``{count}`` 会替换成条数，不写也可以。
         empty_text: 没有结果时的文案。
     """
 
-    limit: int = 5
+    limit: int = 10
     show_source: bool = True
     show_size: bool = False
     show_index: bool = True
     show_ocr: bool = False
-    header: str = "找到 {count} 条完全匹配："
+    header: str = "找到以下结果"
     empty_text: str = "没有找到完全匹配的结果"
 
 
 def format_match(match: ExactMatch, options: OutputOptions,
                  index: int | None = None) -> str:
-    """按 ``url`` / ``content`` 两行的形式格式化一条结果。"""
+    """按 ``链接`` / ``标题`` 两行的形式格式化一条结果。"""
     prefix = f"{index}. " if (options.show_index and index is not None) else ""
-    lines = [f"{prefix}url: {match.url}", f"content: {match.content}"]
+    lines = [f"{prefix}链接: {match.url}", f"标题: {match.content}"]
     extras: list[str] = []
     if options.show_source and match.source:
-        extras.append(f"source: {match.source}")
+        extras.append(f"来源: {match.source}")
     if options.show_size and match.width and match.height:
-        extras.append(f"size: {match.width}x{match.height}")
+        extras.append(f"尺寸: {match.width}x{match.height}")
     lines.extend(extras)
     return "\n".join(lines)
 
@@ -61,9 +61,7 @@ def format_result(result: LensSearchResult,
     blocks = [format_match(m, options, i) for i, m in enumerate(shown, 1)]
     parts: list[str] = []
     if options.header:
-        total = len(result.exact_matches)
-        suffix = f"（共 {total} 条，显示前 {len(shown)} 条）" if total > len(shown) else ""
-        parts.append(options.header.format(count=total) + suffix)
+        parts.append(options.header.format(count=len(result.exact_matches)))
     parts.append("\n\n".join(blocks))
     if options.show_ocr and result.ocr_text:
         parts.append(f"图中文字：\n{result.ocr_text}")

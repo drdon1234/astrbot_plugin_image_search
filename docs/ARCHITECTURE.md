@@ -245,8 +245,9 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
 
 - `titles.py`：`complete_titles()` 抓取目标页 `<title>` 补全被截断的标题。仅当目标页
   标题以截断前缀开头时才替换，避免把跳转首页或反爬页的标题写进结果
-- `formatter.py`：`format_result()` / `format_match()` 按 `url` / `content` 两行输出，
-  插件与本地脚本共用，保证两处输出一致
+- `formatter.py`：`format_result()` / `format_match()` 按 `链接` / `标题` 两行输出，
+  可选附加 `来源` 与 `尺寸`。插件与本地脚本共用，保证两处输出一致。注意展示标签与
+  `ExactMatch` 的字段名（`url` / `content` / `source`）是两回事，改文案不影响字段
 - `models.py`：`ExactMatch` 提供 `truncated` 属性与 `format()`；`LensSearchResult`
   实现 `__bool__` 与 `__len__`，可直接用于真值判断
 - `logger.py`：优先使用 AstrBot 的 logger，独立运行时回退标准库。另提供
@@ -310,7 +311,7 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
 ```python
 IMAGE = "test_imgs/test.png"   # 本地路径（按脚本目录解析）或图片 URL
 MODE = "search"                # search / plugin / ocr / upload
-LIMIT = 5
+LIMIT = 10
 COMPLETE_TITLES = False        # 抓取目标页 <title> 补全被截断的标题
 PROXY = None                   # 如 "http://127.0.0.1:7897"
 HEADED = False                 # 显示浏览器窗口

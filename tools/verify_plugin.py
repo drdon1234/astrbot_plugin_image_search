@@ -241,7 +241,7 @@ def verify_config_mapping(defaults: dict) -> None:
     build_config = plugin_module("image_search.plugin_config").build_config
 
     config = build_config(defaults, data_dir=_StarTools.get_data_dir("cfgtest"))
-    check(config.search.max_results == 5, f"max_results={config.search.max_results}")
+    check(config.search.max_results == 10, f"max_results={config.search.max_results}")
     check(config.search.complete_titles is True,
           f"complete_titles={config.search.complete_titles}")
     check(config.search.timeout_ms == 60_000, f"timeout_ms={config.search.timeout_ms}")
@@ -250,7 +250,7 @@ def verify_config_mapping(defaults: dict) -> None:
     check(config.search.use_cdp is True, "use_cdp 保持默认 True（关键项）")
     check("browser_profile" in str(config.search.resolved_user_data_dir()),
           f"profile 落在插件数据目录: {config.search.resolved_user_data_dir()}")
-    check(config.output.limit == 5, f"output.limit={config.output.limit}")
+    check(config.output.limit == 10, f"output.limit={config.output.limit}")
     check(config.options.idle_close_minutes == 30,
           f"idle_close_minutes={config.options.idle_close_minutes}")
     check(config.search.auto_install_browser is True,
@@ -276,7 +276,7 @@ def verify_config_mapping(defaults: dict) -> None:
     check(dirty.search.max_retries == 0,
           f"max_retries 被夹到 0（{dirty.search.max_retries}）")
     check(dirty.options.user_cooldown_seconds == 15, "非法数字回落到默认值")
-    check(build_config(None).search.max_results == 5, "配置为 None 时用默认值")
+    check(build_config(None).search.max_results == 10, "配置为 None 时用默认值")
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +287,7 @@ def verify_plugin_entry(defaults: dict):
     module = plugin_module("main")
     check(hasattr(module, "ImageSearchPlugin"), "ImageSearchPlugin 已定义")
     plugin = module.ImageSearchPlugin(context=object(), config=defaults)
-    check(plugin.config.search.max_results == 5, "插件实例读到了配置")
+    check(plugin.config.search.max_results == 10, "插件实例读到了配置")
     check(plugin.service.running is False, "浏览器是懒启动，构造时不拉起")
     return plugin
 
@@ -366,11 +366,12 @@ def verify_formatting(plugin) -> None:
         ocr_text="Bunny A Girl!",
     )
     text = formatter.format_result(result, plugin.config.output)
-    check("url: https://shop.lashinbang.com/products/detail/2273450" in text,
-          "输出含 url 行")
-    check("content: BUNNY A GIRL!" in text, "输出含 content 行")
-    check("source: らしんばんオンライン" in text, "默认输出站点名")
-    check("size:" not in text, "默认不输出尺寸")
+    check("链接: https://shop.lashinbang.com/products/detail/2273450" in text,
+          "输出含链接行")
+    check("标题: BUNNY A GIRL!" in text, "输出含标题行")
+    check("来源: らしんばんオンライン" in text, "默认输出站点名")
+    check(text.startswith("找到以下结果"), "抬头为「找到以下结果」")
+    check("尺寸:" not in text, "默认不输出尺寸")
     print("     ---- 实际输出 ----")
     for line in text.splitlines():
         print(f"     {line}")
@@ -550,7 +551,7 @@ async def verify_timeout_guard() -> None:
 async def verify_live(plugin) -> None:
     print("13) 真实搜索（--live）")
     text = await plugin._run_search(str(ROOT / "test_imgs" / "test.png"))
-    check("url: http" in text, "拿到了真实结果")
+    check("链接: http" in text, "拿到了真实结果")
     print("     ---- 实际输出 ----")
     for line in text.splitlines():
         print(f"     {line}")
