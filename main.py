@@ -1,0 +1,307 @@
+"""AstrBot 插件入口：Google Lens 反向搜图。
+
+用法（默认指令 ``搜图``）：
+
+* ``/搜图`` 并在同一条消息里带图片
+* 引用一条带图片的消息，回复 ``/搜图``
+* 只发 ``/搜图``，然后在超时时间内补发图片
+
+搜索逻辑全在 ``image_search`` 包里，这里只负责：取图、调服务、拼消息、
+管生命周期。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image, Reply
+from astrbot.api.star import Context, Star, StarTools, register
+
+from .image_search.exceptions import (
+    BrowserNotAvailableError,
+    ImageSearchError,
+    RateLimitedError,
+)
+from .image_search.formatter import format_result
+from .image_search.logger import logger
+from .image_search.plugin_config import build_config
+from .image_search.service import LensSearchService
+
+PLUGIN_NAME = "astrbot_plugin_image_search"
+
+
+@register(
+    PLUGIN_NAME,
+    "drdon1234",
+    "用 Google Lens 反向搜图，解析完全匹配结果并返回来源链接与标题",
+    "0.1.0",
+)
+class ImageSearchPlugin(Star):
+    def __init__(self, context: Context, config: dict | None = None) -> None:
+        super().__init__(context)
+        self.config = build_config(config, data_dir=self._data_dir())
+        self.service = LensSearchService(
+            self.config.search,
+            idle_close_seconds=self.config.options.idle_close_minutes * 60,
+        )
+        self._cooldown: dict[str, float] = {}
+        self._prepare_task: asyncio.Task[None] | None = None
+        logger.info(
+            "%s 已加载：指令=%s，最多返回 %d 条，浏览器空闲 %d 分钟后关闭",
+            PLUGIN_NAME,
+            self.config.options.command,
+            self.config.search.max_results,
+            self.config.options.idle_close_minutes,
+        )
+        self._schedule_prepare()
+
+    # -- 浏览器预备 ---------------------------------------------------------
+    def _schedule_prepare(self) -> None:
+        """后台补齐浏览器。
+
+        AstrBot 装插件只会装 pip 依赖，不会执行 ``playwright install``，所以
+        官方镜像里浏览器二进制是缺的。这里在插件加载后丢到后台下载，避免用户
+        第一次搜图时干等几分钟。不阻塞加载，失败也只记日志。
+        """
+        if self._prepare_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 没有运行中的事件循环，交给 on_astrbot_loaded 或首次搜索时兜底
+            logger.debug("插件加载时没有事件循环，浏览器预备延后")
+            return
+        self._prepare_task = loop.create_task(self._prepare_browser())
+
+    async def _prepare_browser(self) -> None:
+        try:
+            if self.service.browser_ready():
+                logger.info("浏览器已就绪")
+                return
+            logger.info("浏览器二进制缺失，开始后台自动安装")
+            await self.service.prepare()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("后台准备浏览器失败: %s", exc)
+
+    @filter.on_astrbot_loaded()
+    async def on_loaded(self):
+        """AstrBot 启动完成后再兜一次，覆盖插件加载时没有事件循环的情况。"""
+        self._schedule_prepare()
+
+    @staticmethod
+    def _data_dir():
+        """插件数据目录，浏览器 profile 放在这里，随 AstrBot 数据一起持久化。"""
+        try:
+            return StarTools.get_data_dir(PLUGIN_NAME)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("取插件数据目录失败，用默认位置: %s", exc)
+            return None
+
+    async def terminate(self) -> None:
+        task = self._prepare_task
+        self._prepare_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self.service.close()
+        logger.info("%s 已卸载，浏览器已关闭", PLUGIN_NAME)
+
+    # -- 指令 ---------------------------------------------------------------
+    @filter.command("搜图", alias={"soutu", "sauce", "以图搜图"})
+    async def search_image(self, event: AstrMessageEvent):
+        """用 Google Lens 反搜图片来源。"""
+        limited = self._check_cooldown(event)
+        if limited:
+            yield event.plain_result(limited)
+            return
+
+        # 浏览器还在后台装的时候，给个明确的进度而不是一句失败
+        if not self.service.browser_ready():
+            self._schedule_prepare()
+            yield event.plain_result(
+                f"{self.service.install_status()}\n装好后再发一次就行。")
+            return
+
+        image = self._pick_image(event)
+        if image is None:
+            waited = await self._wait_for_image(event)
+            if waited is None:
+                return
+            image = waited
+
+        hint = self.config.options.working_hint
+        if hint:
+            yield event.plain_result(hint)
+
+        try:
+            payload = await image.convert_to_file_path()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("获取图片失败: %s", exc)
+            yield event.plain_result("拿不到这张图片，换一张再试试")
+            return
+
+        text = await self._run_search(payload)
+        yield event.plain_result(text)
+
+    # -- 内部实现 -----------------------------------------------------------
+    async def _run_search(self, image_path: str) -> str:
+        """执行搜索并把结果和各类失败都转成可直接发送的文本。
+
+        整个搜索套了一层总超时。底层卡死时用户必须能收到明确回复 —— 实测过一种
+        情况：AstrBot 运行期间 pip 升级了 playwright，旧客户端配新 driver 会让
+        Playwright 的连接层静默挂死，我们传给它的 timeout 一概无效，
+        用户只收到「正在搜索」就再也没有下文。
+        """
+        timeout = self.config.options.request_timeout_seconds
+        search = self.service.search(
+            image_path, with_ocr=self.config.output.show_ocr)
+        try:
+            if timeout > 0:
+                result = await asyncio.wait_for(search, timeout)
+            else:
+                result = await search
+        except asyncio.TimeoutError:
+            logger.error("搜索超过 %d 秒没有返回，强制关闭浏览器会话", timeout)
+            await self._force_close()
+            return (f"搜索超时（{timeout} 秒无响应），已重置浏览器会话。\n"
+                    "请稍后重试。若反复出现，请让管理员查看日志，"
+                    "并确认升级过依赖后重启了 AstrBot。")
+        except RateLimitedError:
+            logger.warning("Google 人机验证，重试后仍未通过")
+            return ("Google 触发了人机验证，暂时搜不了。稍后再试，"
+                    "或让管理员换个代理节点。")
+        except BrowserNotAvailableError as exc:
+            logger.error("浏览器不可用: %s", exc)
+            return f"浏览器启动失败，请让管理员检查部署环境：\n{exc}"
+        except ImageSearchError as exc:
+            logger.warning("搜索失败: %s: %s", type(exc).__name__, exc)
+            return f"搜索失败：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("搜图出现未预期的错误: %s", exc)
+            return "搜索出错了，详情见 AstrBot 日志"
+        return format_result(result, self.config.output)
+
+    async def _force_close(self) -> None:
+        """强制释放浏览器会话，让下一次搜索从干净状态重新开始。
+
+        底层卡死时 ``close()`` 自己也可能卡（它同样要等 Playwright 响应），
+        所以再套一层超时；实在关不掉就只记日志，至少不要把这次请求也拖住。
+        """
+        try:
+            await asyncio.wait_for(self.service.close(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.error("关闭浏览器会话同样超时，可能需要重启 AstrBot")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("关闭浏览器会话失败: %s", exc)
+
+    def _check_cooldown(self, event: AstrMessageEvent) -> str:
+        """返回非空字符串表示还在冷却中。"""
+        seconds = self.config.options.user_cooldown_seconds
+        if seconds <= 0:
+            return ""
+        key = event.unified_msg_origin + "|" + str(event.get_sender_id())
+        now = time.monotonic()
+        last = self._cooldown.get(key, 0.0)
+        remaining = seconds - (now - last)
+        if remaining > 0:
+            return f"搜图冷却中，还需 {remaining:.0f} 秒"
+        self._cooldown[key] = now
+        # 顺手清掉过期记录，避免长期运行后字典无限增长
+        if len(self._cooldown) > 256:
+            cutoff = now - seconds
+            self._cooldown = {k: v for k, v in self._cooldown.items() if v > cutoff}
+        return ""
+
+    @staticmethod
+    def _images_in(components) -> list[Image]:
+        return [c for c in (components or []) if isinstance(c, Image)]
+
+    def _pick_image(self, event: AstrMessageEvent) -> Image | None:
+        """从当前消息或被引用的消息里取第一张图片。"""
+        messages = event.get_messages() or []
+        images = self._images_in(messages)
+        if images:
+            return images[0]
+        for component in messages:
+            if isinstance(component, Reply):
+                replied = self._images_in(component.chain)
+                if replied:
+                    return replied[0]
+        return None
+
+    async def _wait_for_image(self, event: AstrMessageEvent) -> Image | None:
+        """指令没带图时，等用户补发一张。等不到或不支持就返回 None。"""
+        seconds = self.config.options.wait_image_seconds
+        if seconds <= 0:
+            await event.send(event.plain_result("请在指令里带上图片，或引用一条图片消息"))
+            return None
+
+        try:
+            from astrbot.core.utils.session_waiter import (
+                SessionController,
+                session_waiter,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("当前 AstrBot 版本不支持 session_waiter: %s", exc)
+            await event.send(event.plain_result("请在指令里带上图片，或引用一条图片消息"))
+            return None
+
+        await event.send(event.plain_result(f"请在 {seconds} 秒内发送要搜索的图片"))
+        picked: list[Image] = []
+
+        @session_waiter(timeout=seconds)
+        async def waiter(controller: SessionController, next_event: AstrMessageEvent):
+            images = self._images_in(next_event.get_messages())
+            if not images:
+                controller.keep(timeout=seconds, reset_timeout=True)
+                return
+            picked.append(images[0])
+            controller.stop()
+
+        try:
+            await waiter(event)
+        except TimeoutError:
+            await event.send(event.plain_result("等待超时，已取消搜图"))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("等待图片时出错: %s", exc)
+            return None
+        finally:
+            event.stop_event()
+
+        return picked[0] if picked else None
+
+    @filter.command("搜图状态", alias={"soutu_status"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def search_status(self, event: AstrMessageEvent):
+        """查看浏览器状态，缺失时触发安装。"""
+        ready = self.service.browser_ready()
+        lines = [
+            f"浏览器: {'已就绪' if ready else '缺失'}",
+            f"安装状态: {self.service.install_status()}",
+            f"浏览器进程: {'运行中' if self.service.running else '未启动'}",
+            f"代理: {self.config.search.proxy or '未配置（直连）'}",
+            f"自动安装: {'开' if self.config.search.auto_install_browser else '关'}",
+        ]
+        if not ready:
+            self._schedule_prepare()
+            lines.append("已触发后台安装，稍后再查。")
+        yield event.plain_result("\n".join(lines))
+
+    # -- 给 LLM 用的函数工具 -------------------------------------------------
+    @filter.llm_tool(name="reverse_image_search")
+    async def reverse_image_search(self, event: AstrMessageEvent, image_url: str):
+        """Reverse image search a picture with Google Lens and return the web pages
+        that contain the exact same image.
+
+        Args:
+            image_url(string): 图片的 http(s) 地址
+        """
+        url = (image_url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return "image_url 需要是 http(s) 图片地址"
+        return await self._run_search(url)

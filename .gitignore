@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+
+# tools/ 下以下划线开头的都是一次性调试脚本与产物，不入库
+tools/_*

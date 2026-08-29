@@ -1,0 +1,159 @@
+{
+    "search": {
+        "description": "搜索行为",
+        "type": "object",
+        "items": {
+            "max_results": {
+                "description": "最多返回条数",
+                "type": "int",
+                "hint": "Google 一页通常给 20 条以上；机器人场景建议 3~8 条，太多会刷屏。",
+                "default": 5
+            },
+            "hl": {
+                "description": "结果页语言",
+                "type": "string",
+                "hint": "影响 Google 返回的标题和站点名的语言。改这个不会改变匹配结果本身。",
+                "options": [
+                    "en",
+                    "zh-CN",
+                    "ja"
+                ],
+                "default": "en"
+            },
+            "complete_titles": {
+                "description": "补全被截断的标题",
+                "type": "bool",
+                "hint": "Google 会把过长的标题截断成“xxx ...”。开启后会去抓目标页的 <title> 补全，属于尽力而为——不少站点有反爬会失败，失败时保留截断标题。会给每条被截断的结果多发一次请求。",
+                "default": true
+            },
+            "with_ocr": {
+                "description": "附带图中文字",
+                "type": "bool",
+                "hint": "额外调用 Lens 的 OCR 接口，把图片里识别出的文字一起发出来。纯 HTTP，开销很小。",
+                "default": false
+            }
+        }
+    },
+    "browser": {
+        "description": "浏览器",
+        "type": "object",
+        "hint": "Google 从 2025-01 起要求搜索页执行 JavaScript，所以必须用真实浏览器渲染结果页。",
+        "items": {
+            "headless": {
+                "description": "无头运行",
+                "type": "bool",
+                "hint": "服务器上保持开启。只有需要人工过一次验证码时才临时关掉。",
+                "default": true
+            },
+            "prefer_bundled_chromium": {
+                "description": "强制使用 Playwright 自带 Chromium",
+                "type": "bool",
+                "hint": "默认会优先找系统安装的 Chrome/Chromium/Edge，找不到才回退。Docker 部署时通常只有自带的，无需改这项。",
+                "default": false
+            },
+            "auto_install_browser": {
+                "description": "自动安装浏览器",
+                "type": "bool",
+                "hint": "AstrBot 装插件只会装 pip 依赖，不会执行 playwright install，所以官方 Docker 镜像里浏览器二进制是缺的。开启后插件加载时会在后台自动下载（约 170MB，2~5 分钟），装到插件数据目录下，容器重建也不会丢。自己管理浏览器的话可以关掉。",
+                "default": true
+            },
+            "install_system_deps": {
+                "description": "自动安装时顺带装系统依赖库",
+                "type": "bool",
+                "hint": "即 playwright install --with-deps。精简镜像缺 libnss3 / libatk-1.0 / libcups 等库，不装的话浏览器下载成功也起不来。需要容器内是 root（官方镜像是），非 root 会自动跳过。会用 apt-get 装包。",
+                "default": true
+            },
+            "install_timeout_minutes": {
+                "description": "自动安装超时（分钟）",
+                "type": "int",
+                "hint": "要下载约 170MB 外加 apt 装库，网络慢时适当加大。",
+                "default": 30
+            },
+            "chrome_path": {
+                "description": "浏览器可执行文件路径",
+                "type": "string",
+                "hint": "留空自动查找。也可以用环境变量 CHROME_PATH 指定。",
+                "default": ""
+            },
+            "proxy": {
+                "description": "代理地址",
+                "type": "string",
+                "hint": "如 http://127.0.0.1:7897。留空则走系统代理或直连。机房 IP 触发人机验证的概率明显更高。",
+                "default": ""
+            },
+            "timeout_seconds": {
+                "description": "单步超时（秒）",
+                "type": "int",
+                "default": 60
+            },
+            "max_retries": {
+                "description": "人机验证重试次数",
+                "type": "int",
+                "hint": "Google 的判定带随机性。重试会先清掉被标记的 cookie 再重新上传，实测能把偶发失败救回来。设 0 表示不重试。",
+                "default": 2
+            },
+            "idle_close_minutes": {
+                "description": "空闲多久关闭浏览器（分钟）",
+                "type": "int",
+                "hint": "浏览器常驻能省掉首次启动开销（冷启动那次要多花 20 秒左右），但会占几百 MB 内存。设 0 表示常驻不关。",
+                "default": 30
+            }
+        }
+    },
+    "output": {
+        "description": "消息输出",
+        "type": "object",
+        "items": {
+            "show_index": {
+                "description": "显示序号",
+                "type": "bool",
+                "default": true
+            },
+            "show_source": {
+                "description": "显示站点名",
+                "type": "bool",
+                "default": true
+            },
+            "show_size": {
+                "description": "显示图片尺寸",
+                "type": "bool",
+                "default": false
+            },
+            "working_hint": {
+                "description": "开始搜索时的提示语",
+                "type": "string",
+                "hint": "留空则不发提示。一次搜索大约 20~30 秒，建议保留。",
+                "default": "正在搜索，请稍候……"
+            },
+            "empty_text": {
+                "description": "没有结果时的文案",
+                "type": "string",
+                "default": "没有找到完全匹配的结果"
+            }
+        }
+    },
+    "limits": {
+        "description": "频率控制",
+        "type": "object",
+        "items": {
+            "user_cooldown_seconds": {
+                "description": "同一用户冷却（秒）",
+                "type": "int",
+                "hint": "0 = 不限制。搜图请求是串行执行的，冷却能避免排队堆积，也降低被 Google 限流的概率。",
+                "default": 15
+            },
+            "wait_image_seconds": {
+                "description": "等待补发图片（秒）",
+                "type": "int",
+                "hint": "只发指令没带图时，等用户补发图片的时长。0 = 不等待，直接提示带图。",
+                "default": 60
+            },
+            "request_timeout_seconds": {
+                "description": "单次搜索总超时（秒）",
+                "type": "int",
+                "hint": "一次搜索最多允许跑多久，超时会重置浏览器并回一条超时提示，确保用户不会只收到「正在搜索」就没了下文。正常一次 20~30 秒，含重试也够用；设 0 表示不限制（不建议）。",
+                "default": 180
+            }
+        }
+    }
+}

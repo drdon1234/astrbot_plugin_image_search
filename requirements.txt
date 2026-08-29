@@ -1,0 +1,12 @@
+# 核心依赖
+httpx==0.28.1
+# playwright 的版本决定了自动下载的浏览器版本，这一点很关键：
+# 实测在同一出口 IP、其他条件完全相同的交替对比下，
+# Chromium 131（playwright 1.49 自带）0/5 通过，
+# Chrome for Testing 151（playwright 1.62 自带）5/5 通过 ——
+# Google 会把过旧的浏览器当可疑客户端拦掉。升级本项时要一并确认浏览器版本够新。
+playwright==1.62.0
+
+# 动图（GIF / 动态 WebP / APNG）抽第一帧用。缺了不会报错，但动图会按原样上传，
+# 实测那样基本搜不到结果。另外 tools/verify_parser.py 用它生成占位图。
+pillow==12.2.0
