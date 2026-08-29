@@ -253,17 +253,32 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
 `extract_items()` 输出 `RawMatch` 列表；`parse_extracted()` 是仅用页面内信息构造结果的
 离线版本，供测试使用。
 
-AI 模式另有一套：`AI_EXTRACT_SCRIPT` 负责在页面上划定正文范围，`clean_ai_summary()`
-负责行级清理。两者的分工与依据见 DESIGN_NOTES 2.10，要点是：
+AI 模式另有一套，分工是「浏览器只定位，Python 做判断」：
 
-- 正文容器取 `[data-subtree="aimfl"]`（首句）往上最近的 `[data-container-id]`，
-  它刚好是「正文 + 追问建议」；`[data-subtree="aimc"]` 是整块回答、**连引用卡片
-  一起**，只作兜底
-- 取容器的 `innerText` 而不是逐个元素抓 —— 句中内联的链接（作品名）会留在句里，
-  隐藏内容本来就不计入 `innerText`，表格单元格之间的 `\t` 换成「：」正好是
-  「字段：值」
-- 清理阶段剔除独占一行的链接文字（引用标记、追问建议），遇到卡片特征行或引导语
-  直接收尾，最后削掉末尾的短噪声行
+- `AI_EXTRACT_SCRIPT`（页面内执行）划定回答子树，优先
+  `[data-subtree="aimc"]` 里的 `[data-container-id="main-col"]`，并给
+  `display:none` / `visibility:hidden` 的元素打上 `data-is-hidden` 标记 ——
+  可见性只有浏览器算得出来，HTML 里看不出来。之后返回整块 `outerHTML`
+- `ai_html_to_text()`（Python 侧，bs4）把这段 HTML 还原成纯文本。放在 Python 侧
+  是为了能离线跑、能用合成 HTML 写断言
+
+`ai_html_to_text()` 的步骤，全部按 DOM 结构判断，不看 AI 说了什么：
+
+1. `_truncate_at_related_grid()` 在「相关内容」图片网格处截断。版面顺序固定为
+   正文 → 网格 → 追问建议 → 分享面板，而网格是唯一形态上可辨的块（几十个
+   `<img>` 加 `<a>`，正文段落各只有一个）。命中就连同后面的兄弟一起删掉，
+   追问建议和分享面板一并消失。网格并非每次都出现（实测 5 份页面命中 2 份），
+   没有网格时不做截断，追问建议会留在输出里 —— 原因见 DESIGN_NOTES 2.10
+2. `_AI_DROP_SELECTORS` 删掉本来就不是正文的元素：`[data-is-hidden]`、
+   引用来源胶囊（`<button>`）、`[aria-hidden="true"]`、图片
+3. 按标签语义转文本：`role="heading"` 与 `h1`~`h6` 当小标题前后留空行，`li`
+   加项目符号，`<table>` 的行转成「字段：值」或竖线分隔，其余块级元素各占一行
+4. `_trim_dangling_tail()` 削掉「以下是更多相关内容：」这类因网格被删而悬空的
+   冒号断尾
+
+截断必须发生在删噪之前 —— 网格里的内容大半带隐藏标记，删噪后它就是个空 `div`。
+认不出网格时不做任何截断，宁可多输出几行追问建议，也不拿措辞去赌：误判的方向是
+砍掉正文，而放过追问只是多几行说明文字。依据与试过的其他判据见 DESIGN_NOTES 2.10。
 
 ### 2.11 输出与辅助模块
 

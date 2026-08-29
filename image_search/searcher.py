@@ -42,7 +42,7 @@ from .parser import (
     AI_EXTRACT_SCRIPT,
     EXTRACT_SCRIPT,
     RawMatch,
-    clean_ai_summary,
+    ai_html_to_text,
     extract_items,
 )
 from .session import LensSession
@@ -157,7 +157,7 @@ class GoogleLensSearcher:
 
         ai_summary = ""
         if isinstance(outcome.ai_payload, dict):
-            ai_summary = clean_ai_summary(outcome.ai_payload)
+            ai_summary = ai_html_to_text(outcome.ai_payload.get("html") or "")
             logger.debug("AI 描述 %d 字", len(ai_summary))
         elif cfg.ai_mode:
             logger.debug("AI 模式没有拿到内容")

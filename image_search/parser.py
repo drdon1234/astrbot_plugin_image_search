@@ -29,6 +29,7 @@ import re
 import urllib.parse as up
 from typing import Any
 
+from .logger import logger
 from .models import ExactMatch
 
 # 在页面上下文里执行，抽出候选结果卡片
@@ -112,102 +113,71 @@ EXTRACT_SCRIPT = r"""
 """
 
 # 宽x高，可能带千分位逗号：739x1,000 / 1,200×1,684
-# 在 AI 模式（udm=50）页面上执行，抽出 AI 给的图片描述。
+# 在 AI 模式（udm=50）页面上执行，把 AI 回答那棵子树整块搬回来。
+#
+# 这个脚本只做两件事：划定子树范围、给不渲染的元素打标记。文本怎么拼、
+# 哪些该丢，全部交给 :func:`ai_html_to_text` 用 bs4 按结构判断 ——
+# 页面脚本里不方便写复杂逻辑，也没法离线测试。
 #
 # 结构（2026-08 实测）：
 #   * AI 回答正文的首个片段带 ``data-subtree="aimfl"``，可以用它判断回答
 #     是否已经开始生成
-#   * 正文各段都**不在** ``<a>`` 里
-#   * 下方的引用来源卡片全部包在 ``<a>`` 里
-#   * 追问建议（「我们可以聊聊：」后面那几条）是可点击的，也在 ``<a>`` 里
-#
-# 所以"取不在 <a> 内的叶子文本块"就能把正文和其余部分分开，不依赖 class
-# （Google 的 class 是哈希且会轮换的）。
+#   * 整块回答在 ``[data-subtree="aimc"]`` 里，主内容列是其中的
+#     ``[data-container-id="main-col"]``
 AI_EXTRACT_SCRIPT = r"""
 () => {
   const anchor = document.querySelector('[data-subtree="aimfl"]');
-  // 容器优先级很关键：
-  //   * 首句所在的 [data-container-id] 容器 = 正文（含追问建议），不含底部卡片
-  //   * [data-subtree="aimc"] 是整块回答，**连引用卡片一起**，只能兜底
-  // 实测前者 3032 字、后者 3442 字，差值就是那堆卡片。
-  let box = anchor ? anchor.closest('[data-container-id]') : null;
-  if (!box) box = document.querySelector('[data-subtree="aimc"]');
-  if (!box && anchor) box = anchor.parentElement;
-  if (!box) return {started: false, blocks: [], drop: [], charCount: 0};
+  const answer = document.querySelector('[data-subtree="aimc"]');
+  // 内容根的优先级：
+  //   1. 回答区里的 [data-container-id="main-col"] —— 主内容列，最干净
+  //   2. [data-subtree="aimc"] —— 整块回答，可能连底部引用卡片一起
+  //   3. 首句所在的 [data-container-id] 容器
+  let root = answer ? answer.querySelector('[data-container-id="main-col"]')
+                    : null;
+  if (!root) root = answer;
+  if (!root && anchor) root = anchor.closest('[data-container-id]');
+  if (!root) return {started: false, html: '', charCount: 0};
 
-  // 直接取容器的 innerText，不逐个元素抓：
-  //   * 句子里内联的链接（作品名、系列名）会留在句中，不会被拆成独立短行
-  //   * 隐藏内容（分享面板、反馈提示）本来就不算进 innerText
-  //   * 表格单元格之间是 \t，换成「：」正好是「字段：值」
-  const text = (box.innerText || '').trim();
-  const blocks = text.split('\n')
-      .map((line) => line.replace(/\t+/g, '：').trim())
-      .filter(Boolean);
-
-  // 收集所有链接的文字。调用方只在「一整行恰好等于某个链接文字」时才丢掉，
-  // 这样独占一行的引用标记（来源胶囊）和追问建议会被剔除，
-  // 而内联在句子里的链接（作品名）所在的行更长、不会误伤。
-  const drop = [];
-  for (const link of box.querySelectorAll('a')) {
-    const linkText = (link.innerText || '').replace(/\t+/g, '：').trim();
-    if (linkText) drop.push(linkText);
+  // 可见性只有浏览器知道，HTML 里看不出来。这里给真正不渲染的元素打个标记，
+  // 交给 Python 侧按标记删除。只认 display:none / visibility:hidden ——
+  // display:contents 的容器自身没有盒子，但内容是可见的，不能算隐藏。
+  for (const el of root.querySelectorAll('*')) {
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') {
+      el.setAttribute('data-is-hidden', '1');
+    }
   }
 
-  return {started: !!anchor, blocks: blocks,
-          drop: Array.from(new Set(drop)), charCount: text.length};
+  return {started: !!anchor, html: root.outerHTML,
+          charCount: (root.innerText || '').trim().length};
 }
 """
 
-# 正文之后的东西，遇到就停：追问建议、展开按钮、分享面板
-_AI_STOP_RE = re.compile(
-    r"(我们可以聊聊|如果[你您](对|想)|想进一步了解|要不要我|需要我帮[你您]"
-    r"|可以为[你您](提供|介绍)|如需(了解|查询|获取|查看)|建议[你您]"
-    r"|[你您]可以(浏览|参考|查看)|以下(精选|相关)"
-    r"|explore (similar|more)|if you('re| are) interested"
-    r"|want to (know|learn) more|related searches?|you (can|may) (also )?browse"
-    r"|^see (more|less)$|^显示(更多|更少)$|^展开$|^收起$"
-    r"|分享公开链接|此公开链接在|无法复制链接|复制链接"
-    r"|^(facebook|twitter|whatsapp|reddit|电子邮件|嵌入)$)",
-    re.IGNORECASE)
-# 页面框架上的固定文案。有 aimfl 锚点时这些基本已被切掉，
-# 这里作为拿不到锚点时的兜底
-_AI_NOISE = {
-    "ai mode", "all", "exact matches", "visual matches", "images", "videos",
-    "shopping", "web", "news", "search", "sign in", "feedback",
-    "send feedback", "settings", "quick settings", "google apps", "privacy",
-    "terms", "help", "tools", "safesearch", "安全搜索", "登录", "设置",
-    "反馈", "隐私权", "条款", "帮助", "工具", "全部", "图片", "视频",
-    "更多", "搜索", "ai 模式", "完全匹配", "视觉匹配", "ai 模式对话",
-    "ai 模式历史记录", "您已退出账号", "跳到主要内容", "无障碍功能帮助",
-    "相似插画与周边视觉", "see more", "see less",
+# 按结构删除的选择器。全部是「这一类元素本身就不是正文」，
+# 和 AI 说了什么无关，所以不会因为 Google 换措辞而失效：
+#   data-is-hidden  提取脚本标记的不渲染元素（隐藏的标题、分享面板、反馈提示）
+#   button          引用来源胶囊，实测是 <button aria-label="相关结果">
+#                   或 <button aria-label="巴哈姆特（另有 6 个）- …">
+#   aria-hidden     纯装饰节点
+_AI_DROP_SELECTORS = (
+    "[data-is-hidden]",
+    "button",
+    '[aria-hidden="true"]',
+    "svg", "img", "picture", "style", "script", "noscript", "template",
+)
+# 块级标签：渲染成纯文本时各占一行
+_AI_BLOCK_TAGS = {
+    "div", "p", "li", "ul", "ol", "tr", "table", "section", "article",
+    "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "br", "hr", "dt", "dd",
 }
-_AI_NOISE_RE = re.compile(
-    r"^(若要访问历史记录|要访问历史记录|管理 AI 模式|AI 模式(历史记录|对话)"
-    r"|您发送了|您已退出|AI 模式针对|AI Mode responded"
-    r"|AI-generated|AI 生成|以上内容由 AI|Google 搜索|Google Search"
-    r"|按 /|Press /|Ctrl\+|结果数|About [\d,]+ results|找到约"
-    r"|跳到主要内容|无障碍功能)",
-    re.IGNORECASE)
-# 引用卡片的行特征。容器边界万一没框住卡片（Google 改版），靠这些兜底：
-#   * 摘要行以日期开头，后面跟破折号
-#   * 来源行是个裸域名
-#   * 「全部显示」是展开整组卡片的按钮
-_AI_CARD_RE = re.compile(
-    r"(^\d{4}年\d{1,2}月\d{1,2}日\s*[—–-]"
-    r"|^\d{1,2}\s+\w{3,9}\s+\d{4}\s*[—–-]"
-    r"|^[\w-]+(\.[\w-]+){1,3}\s*$"
-    r"|^(全部显示|显示全部|show all|view all)"
-    r"|·\s*\d+\s*(年|个?月|天|小时|分钟)前\s*$"
-    r"|·\s*\d+\s*(year|month|week|day|hour|minute)s?\s+ago\s*$)",
-    re.IGNORECASE)
-# 用来判断一行「像不像正文」：有句读或是「字段：值」形式就算正文
-_AI_SENTENCE_RE = re.compile(r"[。！？；，、：:.!?]")
 # AI 拒绝识别时的说法。这类回答没有信息量，当作没有描述处理，
-# 免得输出里只剩一句「抱歉」
+# 免得输出里只剩一句「抱歉」。这是唯一还靠措辞判断的地方 ——
+# 因为「拒答」本身就只能从语义上认出来。
 _AI_REFUSAL_RE = re.compile(
     r"(抱歉[，,]?\s*我无法|我无法(为您)?提供|我不能帮|无法(进行)?识别"
-    r"|无法为您提供|i (can'?t|cannot) help|i'?m (not able|unable)"
-    r"|can'?t provide|unable to (help|provide|identify))",
+    r"|无法为您提供|不(可能|方便)提供|i (can'?t|cannot) help"
+    r"|i'?m (not able|unable)|can'?t provide"
+    r"|unable to (help|provide|identify))",
     re.IGNORECASE)
 
 _DIMENSION_RE = re.compile(r"^(\d[\d,]*)\s*[x×X✕*]\s*(\d[\d,]*)$")
@@ -306,47 +276,166 @@ def _parse_lines(lines: list[str], aria: str | None) -> dict[str, Any]:
             "width": width, "height": height}
 
 
-def clean_ai_summary(payload: dict[str, Any], max_chars: int = 900) -> str:
-    """把 :data:`AI_EXTRACT_SCRIPT` 的结果整理成一段可直接发送的描述。
+def _cells_to_line(cells: list[str]) -> str:
+    """表格一行转成一行文本。两列就是「字段：值」，多列用竖线隔开。"""
+    kept = [c for c in cells if c]
+    if not kept:
+        return ""
+    if len(kept) == 2:
+        return f"{kept[0]}：{kept[1]}"
+    return " | ".join(kept)
 
-    正文范围由 :data:`AI_EXTRACT_SCRIPT` 划定（回答区开头到第一张卡片之前），
-    这里只做行级清理：剔除脚本标出的独立链接行（追问建议、来源标记）、
-    滤掉残留的框架文案、把「AI 拒绝识别」当成没有描述、限制总长度免得刷屏。
 
-    AI 对部分图片会拒答，而且同一张图不是每次都拒 ——
-    拒答文案没有信息量，留着只会在结果里多出一句「抱歉」，所以直接丢掉，
-    让输出只保留完全匹配那部分。
+# 「相关内容」网格的判定门槛。正文段落最多带一个内联链接和一个引用胶囊
+# 图标（各 1 个），网格实测是 60 张图 / 30 个链接 —— 差着一个数量级，
+# 所以门槛取多少都无所谓，这里留足余量。
+_GRID_MIN_IMAGES = 4
+_GRID_MIN_LINKS = 4
+
+
+def _content_layer(root: Any) -> Any:
+    """向下钻到「内容块层」：正文段落彼此为兄弟的那一层。
+
+    ``main-col`` 到正文之间套着几层单子元素的包装 div，层数不固定，
+    所以按「子元素带文字的超过一个」来判断已经到底。
     """
-    drop = {" ".join(str(item).split())
-            for item in (payload.get("drop") or [])}
+    node = root
+    for _ in range(12):
+        kids = [c for c in node.find_all(recursive=False)
+                if c.get_text(strip=True)]
+        if len(kids) != 1:
+            return node
+        node = kids[0]
+    return node
+
+
+def _truncate_at_related_grid(root: Any) -> bool:
+    """砍掉「相关内容」图片网格，以及它后面的一切。
+
+    AI 回答的版面顺序是固定的：正文段落 → 相关内容网格 → 追问建议 →
+    分享／反馈面板。这几段用的属性是同一套（都带 ``data-hveid``），
+    class 又是轮换的哈希，所以唯一稳的分界就是网格本身的形态 ——
+    一个块里塞进几十张缩略图和外链，正文段落做不到这件事。
+
+    命中网格就把它连同后面的兄弟全部删掉，追问建议和分享面板一起没了，
+    不需要再去猜哪句话是引导语。
+
+    网格**不是每次都出现** —— 同一张图多次搜索，有时给网格有时不给。没有
+    网格时这里什么都不做，追问建议会留在输出里。这是权衡后的选择：追问和
+    正文在结构上确实分不开（两者属性同为 ``data-hveid``、``data-sae``，
+    嵌套层级也会互换），硬要区分只能回去赌措辞，而赌错的代价是砍掉正文。
+    多几行说明文字用户一眼能忽略，少了正文却看不出来。
+
+    注意必须在删 ``img``/``[data-is-hidden]`` **之前**调用：网格里的图和
+    文字大半带隐藏标记，删完之后它就是个空 div，特征全没了。
+
+    Returns:
+        是否找到并截断了网格。
+    """
+    layer = _content_layer(root)
+    for block in layer.find_all(recursive=False):
+        if (len(block.find_all("img")) >= _GRID_MIN_IMAGES
+                and len(block.find_all("a")) >= _GRID_MIN_LINKS):
+            for tail in list(block.find_next_siblings()):
+                tail.decompose()
+            block.decompose()
+            return True
+    return False
+
+
+_SENTENCE_END = ("。", "！", "!", "？", "?", "；", ";", ".")
+
+
+def _trim_dangling_tail(lines: list[str]) -> None:
+    """把结尾悬空的引导句砍掉。
+
+    正文最后一段常以冒号收尾去引出下面的网格（「以下是更多相关内容：」）。
+    网格已经被 :func:`_truncate_at_related_grid` 删了，这个冒号就悬着。
+    能退回同一行里上一个句末标点就只砍这半句，否则整行丢掉。
+
+    只处理冒号，是因为它在标点上就代表「后面还有东西」，和 AI 怎么措辞无关。
+    """
+    while lines and lines[-1].endswith(("：", ":")):
+        tail = lines[-1]
+        for mark in _SENTENCE_END:
+            index = tail.rfind(mark)
+            if index > 0:
+                lines[-1] = tail[: index + len(mark)]
+                return
+        lines.pop()
+
+
+def ai_html_to_text(html: str, max_chars: int = 900) -> str:
+    """把 AI 回答的 HTML 片段按结构还原成纯文本。
+
+    做法完全依赖 DOM 结构，不去猜 AI 说了什么：
+
+    * 先在「相关内容」图片网格处截断，网格连同后面的追问建议、分享面板
+      一起丢掉（见 :func:`_truncate_at_related_grid`）
+    * 再按选择器删掉「本来就不是正文」的元素 —— 提取脚本标记的不渲染元素、
+      引用来源胶囊（``<button>``）、装饰节点（``aria-hidden``）、图片
+    * 剩下的按标签语义转文本：``role="heading"`` 和 ``h1``~``h6`` 当小标题，
+      ``li`` 加项目符号，``table`` 的行转成「字段：值」，其余块级元素各占一行
+
+    这样 Google 换措辞、换语言都不影响解析，只有改动 DOM 结构才需要跟进。
+    万一版面变了、网格认不出来，结果是多输出几行追问建议，而不是把正文
+    截断或者丢掉 —— 宁可多给，不能少给。
+
+    AI 对部分图片会拒答，而且同一张图不是每次都拒。拒答文案
+    没有信息量，留着只会在结果里多出一句「抱歉」，所以整段丢掉，让输出只保留
+    完全匹配那部分。
+    """
+    if not html:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:  # pragma: no cover
+        logger.warning("未安装 beautifulsoup4，无法解析 AI 描述")
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.body or soup
+    # 顺序要紧：网格靠「一堆 img + 一堆 a」认出来，删噪会把这些特征抹掉
+    if not _truncate_at_related_grid(root):
+        logger.debug("AI 回答里没找到相关内容网格，按原样输出")
+    for selector in _AI_DROP_SELECTORS:
+        for node in root.select(selector):
+            node.decompose()
+
+    # 表格先整体转成文本行，免得单元格被拆成一堆孤立短句
+    for table in root.find_all("table"):
+        rows = [_cells_to_line([" ".join(cell.get_text(" ", strip=True).split())
+                                for cell in row.find_all(["th", "td"])])
+                for row in table.find_all("tr")]
+        table.replace_with("\n" + "\n".join(r for r in rows if r) + "\n")
+
+    # 列表里夹着占位用的空 li（实测每个 ul 首尾各一个），加了符号就会在
+    # 输出里留下一个孤零零的「•」
+    for item in root.find_all("li"):
+        if item.get_text(strip=True):
+            item.insert(0, "• ")
+    # 小标题前后留空行，读起来有层次
+    for heading in root.find_all(
+            lambda tag: tag.name in {"h1", "h2", "h3", "h4", "h5", "h6"}
+            or tag.get("role") == "heading"):
+        heading.insert_before("\n")
+        heading.insert_after("\n")
+    for tag in root.find_all(lambda t: t.name in _AI_BLOCK_TAGS):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+
     lines: list[str] = []
     seen: set[str] = set()
-    for raw in payload.get("blocks") or []:
-        text = " ".join(str(raw).split())
-        if not text or text in drop or text in seen:
-            continue
-        if text.lower() in _AI_NOISE:
-            continue
-        if _AI_NOISE_RE.match(text):
-            continue
-        # 卡片区一旦开始，后面就全是卡片了，直接收尾
-        if _AI_CARD_RE.search(text) or _AI_STOP_RE.search(text):
-            break
-        if len(text) < 4:
+    # 分隔符必须是空串：用 "\n" 会在每个文本节点之间都插换行，句子会被
+    # <strong> 之类的内联标签切碎。换行只来自上面显式插入的那些。
+    for raw in root.get_text("").splitlines():
+        text = " ".join(raw.split())
+        if not text or text in seen:
             continue
         seen.add(text)
         lines.append(text)
 
-    # 收尾：削掉末尾那些「短且没有标点」的行。卡片区总在最后，来源站点名
-    # （手机新浪网、Pinterest 之类）就长这样；正文的小标题不会落在最后一行，
-    # 而「字段：值」形式带冒号，不会被误删。
-    while lines:
-        tail = lines[-1]
-        if len(tail) <= 24 and not _AI_SENTENCE_RE.search(tail):
-            lines.pop()
-            continue
-        break
-
+    _trim_dangling_tail(lines)
     summary = "\n".join(lines).strip()
     if summary and _AI_REFUSAL_RE.search(summary) and len(summary) < 200:
         return ""
@@ -356,7 +445,7 @@ def clean_ai_summary(payload: dict[str, Any], max_chars: int = 900) -> str:
         for mark in ("。", "\n", ". "):
             index = cut.rfind(mark)
             if index > max_chars * 0.6:
-                cut = cut[:index + len(mark)]
+                cut = cut[: index + len(mark)]
                 break
         summary = cut.rstrip() + "…"
     return summary

@@ -10,3 +10,7 @@ playwright==1.62.0
 # 动图（GIF / 动态 WebP / APNG）抽第一帧用。缺了不会报错，但动图会按原样上传，
 # 实测那样基本搜不到结果。另外 tools/verify_parser.py 用它生成占位图。
 pillow==12.2.0
+
+# 解析 AI 模式回答的 HTML 片段。按 DOM 结构还原成纯文本（标题、列表、表格），
+# 不靠正则猜测措辞 —— 详见 docs/DESIGN_NOTES.md 2.10。
+beautifulsoup4==4.14.2
