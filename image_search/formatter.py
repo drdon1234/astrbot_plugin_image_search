@@ -20,8 +20,9 @@ class OutputOptions:
         show_size: 是否输出图片尺寸。
         show_index: 是否给每条加序号。
         show_ocr: 是否附上 OCR 文字。
-        header: 结果前面的抬头。``{count}`` 会替换成条数，不写也可以。
-        empty_text: 没有结果时的文案。
+        header: 完全匹配列表前面的抬头。``{count}`` 会替换成条数，不写也可以。
+        ai_header: AI 描述前面的抬头；留空则直接输出描述。
+        empty_text: 两种模式都没有内容时的文案。
     """
 
     limit: int = 10
@@ -30,6 +31,7 @@ class OutputOptions:
     show_index: bool = True
     show_ocr: bool = False
     header: str = "找到以下结果"
+    ai_header: str = "【图片描述】"
     empty_text: str = "没有找到完全匹配的结果"
 
 
@@ -49,20 +51,35 @@ def format_match(match: ExactMatch, options: OutputOptions,
 
 def format_result(result: LensSearchResult,
                   options: OutputOptions | None = None) -> str:
-    """把整个搜索结果格式化成一段文本。"""
+    """把整个搜索结果格式化成一段文本。
+
+    两种结果模式是各自独立的：只要其中一种有内容就正常输出，两种都空才回落到
+    ``empty_text``。所以关掉完全匹配、只留 AI 描述也能正常工作。
+    """
     options = options or OutputOptions()
-    if not result.exact_matches:
+    parts: list[str] = []
+
+    if result.ai_summary:
+        if options.ai_header:
+            parts.append(f"{options.ai_header}\n{result.ai_summary}")
+        else:
+            parts.append(result.ai_summary)
+
+    if result.exact_matches:
+        shown = result.exact_matches[: max(1, options.limit)]
+        blocks = [format_match(m, options, i) for i, m in enumerate(shown, 1)]
+        section = "\n\n".join(blocks)
+        if options.header:
+            section = (options.header.format(count=len(result.exact_matches))
+                       + "\n" + section)
+        parts.append(section)
+
+    if not parts:
         text = options.empty_text
         if options.show_ocr and result.ocr_text:
             text += f"\n\n图中文字：\n{result.ocr_text}"
         return text
 
-    shown = result.exact_matches[: max(1, options.limit)]
-    blocks = [format_match(m, options, i) for i, m in enumerate(shown, 1)]
-    parts: list[str] = []
-    if options.header:
-        parts.append(options.header.format(count=len(result.exact_matches)))
-    parts.append("\n\n".join(blocks))
     if options.show_ocr and result.ocr_text:
         parts.append(f"图中文字：\n{result.ocr_text}")
     return "\n\n".join(parts)

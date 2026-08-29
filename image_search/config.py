@@ -13,9 +13,11 @@ DEFAULT_UA = (
 # Google 的 cookie 同意声明，避免被同意弹窗挡住
 SOCS_COOKIE = "CAESHAgBEhJnd3NfMjAyNDA2MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg"
 
-# Lens 结果页的 udm 取值
+# Lens 结果页的 udm 取值。实测同一个 vsrid 换 udm 就能切换标签页
 UDM_ALL = "26"
+UDM_VISUAL_MATCHES = "44"
 UDM_EXACT_MATCHES = "48"
+UDM_AI_MODE = "50"
 
 
 @dataclasses.dataclass(slots=True)
@@ -49,6 +51,15 @@ class SearchConfig:
         proxy: 传给浏览器的代理地址，如 ``http://127.0.0.1:7897``。
             为空则走系统代理 / TUN。
         hl: 结果页语言。
+        exact_matches: 是否抓「完全匹配」结果（收录该图的页面列表）。
+        ai_mode: 是否抓「AI 模式」的图片描述。和 ``exact_matches`` 相互独立，
+            两个都开时只上传一次，然后分别打开两个标签页。
+        safe_search: 是否开启 Google 的安全搜索过滤。默认关闭 ——
+            实测 ``safe=active`` 会把命中过滤的结果**清空**（不是部分过滤），
+            而 Google 的默认值随出口 IP 所在地区变化，部分地区强制开启。
+            显式传 ``safe=off`` 才能让行为可预期。
+        ai_wait_ms: 等 AI 回答生成完的最长时间（毫秒）。它是流式输出的，
+            打开页面时还没写完，实测 11~12 秒收敛。
         timeout_ms: 单步操作超时（毫秒）。
         settle_ms: 结果页渲染后额外等待时间（毫秒），等异步块加载完。
         warmup: 浏览器启动后是否先访问一次 Google 首页拿 cookie。
@@ -78,6 +89,10 @@ class SearchConfig:
     user_data_dir: pathlib.Path | None = None
     proxy: str | None = None
     hl: str = "en"
+    exact_matches: bool = True
+    ai_mode: bool = True
+    safe_search: bool = False
+    ai_wait_ms: int = 30_000
     timeout_ms: int = 60_000
     settle_ms: int = 4_000
     warmup: bool = True

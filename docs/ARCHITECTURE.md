@@ -55,18 +55,26 @@ astrbot_plugin_image_search/
     └── formatter.py             # 结果格式化
 ```
 
-### 1.3 检索流程的三段划分
+### 1.3 检索流程的划分
 
-一次检索由三段组成，各段的执行位置不同。这个划分是核心约束，改动前务必先读
-DESIGN_NOTES 第 2 节。
+一次检索由上传、抓取、链接还原三段组成，各段的执行位置不同。这个划分是核心约束，
+改动前务必先读 DESIGN_NOTES 第 2 节。
 
 | 步骤 | 实现 | 执行位置 |
 | --- | --- | --- |
 | 1. 上传 | 向 Lens 首页的 `input[type=file]` 写入文件，等待 Google 跳转至带 `vsrid` 的结果页 | 浏览器内 |
-| 2. 渲染与提取 | 将地址的 `udm` 改为 48，重新导航，等待渲染完成后在页面上下文执行提取脚本 | 浏览器内 |
+| 2a. 完全匹配 | 将地址的 `udm` 改为 48，重新导航，渲染完成后在页面上下文执行提取脚本 | 浏览器内 |
+| 2b. AI 描述 | 将 `udm` 改为 50，等流式回答收敛后提取正文 | 浏览器内 |
 | 3. 链接还原 | 请求 `/goto?url=...` 读取 302 响应的 `Location` | httpx（带代理） |
 
-`udm=26` 为「全部结果」，`udm=48` 为「完全匹配」。
+`udm` 取值：26 全部、44 视觉匹配、48 完全匹配、50 AI 模式。
+
+**两种结果模式是正交的**，由 `exact_matches` 与 `ai_mode` 两个开关独立控制，默认
+都开。同一个 `vsrid` 换 `udm` 就能切标签页，所以两个模式共用一次上传，开两个只
+多渲染一个页面。都关会在 `_search_once()` 里直接抛 `ParseError`，避免白跑一次上传。
+
+`safe` 参数始终显式带上（默认 `safe=off`）—— 它的默认值随出口 IP 所在地区变化，
+而 `safe=active` 会把命中过滤的结果**完全清空**，症状和「图片没被收录」无从分辨。
 
 OCR 是一条独立链路：`POST /v3/upload` 与 `GET /qfmetadata` 两步必须共用同一个
 HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
@@ -190,8 +198,12 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
   UA 后重启一次、`connect_over_cdp()` 附加、`_prepare_context()` 注入 `SOCS` cookie
   并按需预热。`_start_playwright_launch()` 仅作后备，正常路径不会走到
 - `upload_and_extract()` 完成第 1、2 段：打开 Lens 首页、`_dismiss_consent()` 处理同意
-  弹窗、`_submit_image()` 提交图片、改写 `udm` 后导航、`_settle()` 等待渲染并滚动触发
-  懒加载、在页面上下文执行提取脚本
+  弹窗、`_submit_image()` 提交图片，然后按 `exact_script` / `ai_script` 是否传入决定
+  抓哪些标签页，结果装进 `LensPageResult`（`exact_payload` / `ai_payload`，没抓的
+  保持 `None`）
+- `_collect_ai()` 抓 AI 模式页。回答是流式输出的，打开页面时才刚开始写，这里轮询
+  提取脚本直到「已开始生成」且「字数连续 3 轮不再增长」，上限 `ai_wait_ms`
+  （默认 30 秒，实测 11~12 秒收敛）。抓不到就返回 `None`，不影响完全匹配那一路
 - `_submit_image()` 倒序尝试页面上的多个 `input[type=file]`；检测到 `vsrid` 后仍需
   等待 `networkidle` 与固定时长，等 Google 补全查询参数，否则据此改写出的完全匹配
   页没有结果
@@ -240,6 +252,18 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
 
 `extract_items()` 输出 `RawMatch` 列表；`parse_extracted()` 是仅用页面内信息构造结果的
 离线版本，供测试使用。
+
+AI 模式另有一套：`AI_EXTRACT_SCRIPT` 负责在页面上划定正文范围，`clean_ai_summary()`
+负责行级清理。两者的分工与依据见 DESIGN_NOTES 2.10，要点是：
+
+- 正文容器取 `[data-subtree="aimfl"]`（首句）往上最近的 `[data-container-id]`，
+  它刚好是「正文 + 追问建议」；`[data-subtree="aimc"]` 是整块回答、**连引用卡片
+  一起**，只作兜底
+- 取容器的 `innerText` 而不是逐个元素抓 —— 句中内联的链接（作品名）会留在句里，
+  隐藏内容本来就不计入 `innerText`，表格单元格之间的 `\t` 换成「：」正好是
+  「字段：值」
+- 清理阶段剔除独占一行的链接文字（引用标记、追问建议），遇到卡片特征行或引导语
+  直接收尾，最后削掉末尾的短噪声行
 
 ### 2.11 输出与辅助模块
 

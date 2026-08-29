@@ -3,6 +3,24 @@
         "description": "搜索行为",
         "type": "object",
         "items": {
+            "exact_matches": {
+                "description": "返回完全匹配结果",
+                "type": "bool",
+                "hint": "Google Lens 的「Exact matches」栏，列出收录了这张图的网页。和「AI 图片描述」相互独立，可以只开一个。两个都关会直接报错。",
+                "default": true
+            },
+            "ai_mode": {
+                "description": "返回 AI 图片描述",
+                "type": "bool",
+                "hint": "Google Lens 的「AI Mode」栏，用自然语言说明这张图是什么（作品、角色、出处等）。图片没被任何网页收录时它往往仍能给出答案。会让单次搜索多花 10 秒左右，且输出语言由 Google 按出口 IP 判定。",
+                "default": true
+            },
+            "safe_search": {
+                "description": "开启安全搜索过滤",
+                "type": "bool",
+                "hint": "默认关闭。实测开启后命中过滤的图片会直接返回 0 条结果（不是部分过滤），而且症状和「图片没被收录」一样无法分辨。关闭时插件会显式告知 Google 不要过滤，避免受出口 IP 所在地区的默认设置影响。",
+                "default": false
+            },
             "max_results": {
                 "description": "最多返回条数",
                 "type": "int",
@@ -124,6 +142,12 @@
                 "type": "string",
                 "hint": "留空则不发提示。一次搜索大约 20~30 秒，建议保留。",
                 "default": "正在搜索，请稍候……"
+            },
+            "ai_header": {
+                "description": "AI 描述前的抬头",
+                "type": "string",
+                "hint": "只在开启「返回 AI 图片描述」时使用。留空则直接输出描述文字，不加抬头。",
+                "default": "【图片描述】"
             },
             "empty_text": {
                 "description": "没有结果时的文案",

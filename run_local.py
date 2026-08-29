@@ -28,6 +28,16 @@ MODE = "search"
 #: 最多返回几条结果
 LIMIT = 10
 
+#: 是否要「完全匹配」结果（收录该图的网页列表）
+EXACT_MATCHES = True
+
+#: 是否要「AI 模式」的图片描述。会多花 10 秒左右。
+#: 两个都设 False 会直接报错——那样没有任何可返回的内容。
+AI_MODE = True
+
+#: 是否开启安全搜索过滤。默认关闭，开启后命中过滤的图片会返回 0 条结果。
+SAFE_SEARCH = False
+
 #: 结果页语言，影响标题和站点名的语言，不影响匹配结果
 HL = "en"
 
@@ -96,6 +106,9 @@ def build_search_config() -> SearchConfig:
         proxy=PROXY,
         hl=HL,
         max_results=LIMIT,
+        exact_matches=EXACT_MATCHES,
+        ai_mode=AI_MODE,
+        safe_search=SAFE_SEARCH,
         complete_titles=COMPLETE_TITLES,
         debug_dir=(_ROOT / "tools" / "_dump" / "debug") if DEBUG else None,
     )
@@ -107,6 +120,9 @@ def build_plugin_config():
         "search": {
             "max_results": LIMIT,
             "hl": HL,
+            "exact_matches": EXACT_MATCHES,
+            "ai_mode": AI_MODE,
+            "safe_search": SAFE_SEARCH,
             "complete_titles": COMPLETE_TITLES,
             "with_ocr": True,
         },

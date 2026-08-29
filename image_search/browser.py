@@ -13,7 +13,9 @@ Playwright launch 必被拦，而普通启动 Chrome + CDP 附加可以正常拿
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pathlib
+import time
 from typing import Any
 
 from .chrome import (
@@ -39,7 +41,22 @@ from .installer import (
     default_browsers_dir,
 )
 from .logger import logger, quiet_http_logs
-from .uploader import to_exact_matches_url
+from .uploader import to_ai_mode_url, to_exact_matches_url
+
+
+@dataclasses.dataclass(slots=True)
+class LensPageResult:
+    """一次上传之后从各标签页抓到的原始产物。
+
+    ``*_payload`` 是页面里提取脚本的返回值，还没解析；解析交给
+    :mod:`image_search.parser`。哪一栏没抓就保持 ``None``。
+    """
+
+    lens_url: str
+    exact_url: str = ""
+    exact_payload: Any = None
+    ai_url: str = ""
+    ai_payload: Any = None
 
 _CAPTCHA_HINT = (
     "Google 弹出了人机验证（/sorry/index）。\n"
@@ -399,9 +416,11 @@ class BrowserSession:
                 continue
 
     async def upload_and_extract(self, image: bytes, filename: str, mime: str,
-                                 script: str, debug_name: str | None = None,
-                                 ) -> tuple[Any, str, str]:
-        """在浏览器里上传图片、切到完全匹配页、执行提取脚本。
+                                 exact_script: str | None = None,
+                                 ai_script: str | None = None,
+                                 debug_name: str | None = None,
+                                 ) -> LensPageResult:
+        """在浏览器里上传图片，然后按需抓「完全匹配」和「AI 模式」两个标签页。
 
         为什么上传要在浏览器里做：``vsrid`` 会话绑定在上传方的身份上，
         换别的客户端上传、再让浏览器打开结果页，页面会显示
@@ -410,8 +429,12 @@ class BrowserSession:
         （1.49 时还共享），所以只剩「走真实上传界面」这条稳的路 ——
         它本来也最贴近真实用户行为。
 
-        Returns:
-            ``(脚本返回值, 完全匹配页地址, 上传后的结果页地址)``
+        两种模式共用同一次上传：拿到 ``vsrid`` 之后只要改 ``udm`` 就能切标签，
+        所以开两个模式的代价只是多渲染一个页面，不用重新上传。
+
+        Args:
+            exact_script: 完全匹配页上执行的提取脚本；``None`` 表示不抓这一栏。
+            ai_script: AI 模式页上执行的提取脚本；``None`` 表示不抓。
         """
         cfg = self._config
         page, opened = await self._new_page()
@@ -429,21 +452,32 @@ class BrowserSession:
 
             lens_url = await self._submit_image(page, image, filename, mime)
             logger.debug("上传后的结果页: %s", lens_url)
+            outcome = LensPageResult(lens_url=lens_url)
 
-            exact_url = to_exact_matches_url(lens_url, cfg.hl)
-            logger.debug("完全匹配页: %s", exact_url)
-            try:
-                await page.goto(exact_url, wait_until="domcontentloaded",
-                                timeout=cfg.timeout_ms)
-            except Exception as exc:  # noqa: BLE001
-                raise FetchError(
-                    f"打开完全匹配页失败: {type(exc).__name__}: {exc}") from exc
-            self._assert_not_blocked(page.url)
-            await self._settle(page)
-            data = await page.evaluate(script)
-            if cfg.debug_dir and debug_name:
-                await self._dump(page, debug_name)
-            return data, exact_url, lens_url
+            if exact_script is not None:
+                outcome.exact_url = to_exact_matches_url(
+                    lens_url, cfg.hl, cfg.safe_search)
+                logger.debug("完全匹配页: %s", outcome.exact_url)
+                try:
+                    await page.goto(outcome.exact_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=cfg.timeout_ms)
+                except Exception as exc:  # noqa: BLE001
+                    raise FetchError(
+                        f"打开完全匹配页失败: {type(exc).__name__}: {exc}") from exc
+                self._assert_not_blocked(page.url)
+                await self._settle(page)
+                outcome.exact_payload = await page.evaluate(exact_script)
+                if cfg.debug_dir and debug_name:
+                    await self._dump(page, debug_name)
+
+            if ai_script is not None:
+                outcome.ai_url = to_ai_mode_url(lens_url, cfg.hl,
+                                                cfg.safe_search)
+                logger.debug("AI 模式页: %s", outcome.ai_url)
+                outcome.ai_payload = await self._collect_ai(
+                    page, outcome.ai_url, ai_script, debug_name)
+            return outcome
         finally:
             if opened:
                 await page.close()
@@ -452,6 +486,48 @@ class BrowserSession:
                     await page.goto("about:blank")
                 except Exception:  # noqa: BLE001
                     pass
+
+    async def _collect_ai(self, page: Any, url: str, script: str,
+                          debug_name: str | None) -> Any:
+        """打开 AI 模式页，等回答写完再抽取。抓不到就返回 None，不影响主流程。
+
+        AI 的回答是流式输出的，打开页面时才刚开始写。这里等到「已经开始生成」
+        且「字数连续几轮不再增长」为止，实测 11~12 秒收敛。
+        """
+        cfg = self._config
+        try:
+            await page.goto(url, wait_until="domcontentloaded",
+                            timeout=cfg.timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("打开 AI 模式页失败，跳过: %s", exc)
+            return None
+        self._assert_not_blocked(page.url)
+
+        deadline = time.monotonic() + cfg.ai_wait_ms / 1000
+        payload: Any = None
+        last, stable = -1, 0
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(1200)
+            try:
+                payload = await page.evaluate(script)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("AI 模式提取脚本执行失败: %s", exc)
+                return None
+            count = int(payload.get("charCount") or 0)
+            if not payload.get("started") and count == 0:
+                continue
+            if count == last:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable, last = 0, count
+        else:
+            logger.debug("AI 回答在 %d ms 内没有收敛，用当前内容",
+                         cfg.ai_wait_ms)
+        if cfg.debug_dir and debug_name:
+            await self._dump(page, f"{debug_name}_ai")
+        return payload
 
     async def _submit_image(self, page: Any, image: bytes, filename: str,
                             mime: str) -> str:

@@ -501,6 +501,191 @@ async def verify_wait_fallback(plugin) -> None:
     plugin.config.options.wait_image_seconds = 60
 
 
+def verify_result_modes(defaults: dict) -> None:
+    """两种结果模式是正交的：各自独立开关，输出互不依赖。"""
+    print("14) 结果模式（AI 描述 / 完全匹配）")
+    build_config = plugin_module("image_search.plugin_config").build_config
+    parser = plugin_module("image_search.parser")
+    formatter = plugin_module("image_search.formatter")
+    models = plugin_module("image_search.models")
+    uploader = plugin_module("image_search.uploader")
+
+    config = build_config(defaults, data_dir=_StarTools.get_data_dir("modes"))
+    check(config.search.exact_matches is True, "默认开启完全匹配")
+    check(config.search.ai_mode is True, "默认开启 AI 描述")
+    check(config.search.safe_search is False, "默认关闭安全搜索过滤")
+
+    location = "https://www.google.com/search?vsrid=ABC&udm=26"
+    check("udm=48" in uploader.to_exact_matches_url(location, "en"),
+          "完全匹配页 udm=48")
+    check("udm=50" in uploader.to_ai_mode_url(location, "en"),
+          "AI 模式页 udm=50")
+    check("safe=off" in uploader.to_ai_mode_url(location, "en"),
+          "默认显式带 safe=off")
+    check("safe=active" in uploader.to_ai_mode_url(location, "en", True),
+          "开启过滤时带 safe=active")
+
+    # AI 正文清理：剔除独立链接行、滤掉框架文案、在引导语处截断
+    payload = {
+        "started": True,
+        "blocks": [
+            "AI 模式",
+            "若要访问历史记录和获享其他好处，请登录您的账号",
+            "这张图片是轻小说《青春猪头少年系列》的同人画集封面。",
+            "图中描绘的角色是女主角樱岛麻衣。",
+            "Character：Mai Sakurajima",
+            "Origin：C95 Comiket Artbook BUNNY A GIRL!",
+            "rascaldoesnotdream.com",
+            "推荐原作小说的阅读顺序与各卷标题",
+            "如果你对这个系列感兴趣，我们可以聊聊：",
+            "系列的最新剧情发展",
+        ],
+        "drop": ["rascaldoesnotdream.com", "推荐原作小说的阅读顺序与各卷标题"],
+        "charCount": 160,
+    }
+    summary = parser.clean_ai_summary(payload)
+    check("同人画集封面" in summary and "樱岛麻衣" in summary, "保留了正文段落")
+    check("Character：Mai Sakurajima" in summary
+          and "Origin：C95" in summary, "保留了表格行")
+    check("登录您的账号" not in summary, "滤掉了登录提示")
+    check("AI 模式" not in summary, "滤掉了标签栏文案")
+    check("rascaldoesnotdream.com" not in summary, "剔除了来源标记（独立链接行）")
+    check("阅读顺序与各卷标题" not in summary, "剔除了追问建议（独立链接行）")
+    check("我们可以聊聊" not in summary and "最新剧情发展" not in summary,
+          "在引导语处截断")
+
+    # 引导语的几种真实说法，含敬语
+    for lead in ("如果您对该作品感兴趣，我可以为您提供更多相关信息：",
+                 "如需了解更多相关精彩内容，您可以浏览以下精选剧照与插画：",
+                 "如果你对这个系列感兴趣，我们可以聊聊：",
+                 "If you're interested, I can share more:",
+                 "Explore similar official artwork:"):
+        cut = parser.clean_ai_summary({"blocks": [
+            "这张图片是某作品的官方插画，画面里有一名角色。",
+            lead,
+            "建议条目一", "建议条目二",
+        ], "drop": [], "charCount": 120})
+        check("官方插画" in cut and "建议条目" not in cut,
+              f"引导语处截断：{lead[:20]}")
+
+    dup = parser.clean_ai_summary({"blocks": ["重复出现的一段描述。",
+                                             "重复出现的一段描述。",
+                                             "另一段独立的描述文字。"],
+                                   "drop": [], "charCount": 60})
+    check(dup.count("重复出现的一段描述。") == 1, "重复块只保留一次")
+    check("另一段独立的描述文字。" in dup, "去重不影响其他段落")
+
+    # 卡片区一旦出现就收尾
+    for card_line in ("wall.alphacoders.com",
+                      "2023年7月17日 — Mai Sakurajima in Skirt",
+                      "17 July 2023 — Some English summary",
+                      "情報】溝口ケージ老師 C95 全彩本封面公開 ... · 8 years ago",
+                      "青春猪头少年】OST 1小时循环_哔哩哔哩 · 2 months ago",
+                      "全部显示"):
+        cut = parser.clean_ai_summary({"blocks": [
+            "这是一段正常的图片描述文字，说明画面内容。",
+            card_line,
+            "这一行在卡片之后，不应出现",
+        ], "drop": [], "charCount": 200})
+        check("正常的图片描述文字" in cut and "不应出现" not in cut,
+              f"遇到卡片行即收尾：{card_line[:26]}")
+    check(parser.clean_ai_summary({"blocks": ["作品编号：ABCD-123"],
+                                   "drop": [], "charCount": 20})
+          == "作品编号：ABCD-123", "含点号的正常字段不被当成域名")
+
+    # 引用标记：整行等于链接文字才丢，内联链接不受影响
+    inline = parser.clean_ai_summary({"blocks": [
+        "这张图片出自《青春猪头少年系列》，是官方插画。",
+        "巴哈姆特",
+        "DARLING in the FRANXX Wiki",
+    ], "drop": ["青春猪头少年系列", "巴哈姆特", "DARLING in the FRANXX Wiki"],
+        "charCount": 120})
+    check("《青春猪头少年系列》，是官方插画" in inline,
+          "句中内联的链接不影响整行")
+    check("巴哈姆特" not in inline.splitlines()
+          and "DARLING in the FRANXX Wiki" not in inline.splitlines(),
+          "独占一行的引用标记被剔除")
+
+    # 尾部裁剪：末尾的来源站点名要削掉，正文和「字段：值」要留住
+    tailed = parser.clean_ai_summary({"blocks": [
+        "这张图片是某作品的官方插画。",
+        "画面内容： 角色站在海滩上。",
+        "手机新浪网",
+        "哈啦區- 巴哈姆特",
+        "Pinterest",
+    ], "drop": [], "charCount": 120}).splitlines()
+    check(tailed[-1].startswith("画面内容"), "末尾停在最后一条正文上")
+    for noise in ("手机新浪网", "哈啦區- 巴哈姆特", "Pinterest"):
+        check(noise not in tailed, f"尾部噪声被削掉：{noise}")
+    kept_tail = parser.clean_ai_summary({"blocks": [
+        "这张图片是某作品的插画。", "代码： Code:002",
+    ], "drop": [], "charCount": 60}).splitlines()
+    check(kept_tail[-1] == "代码： Code:002", "「字段：值」不会被尾部裁剪误删")
+    check(parser.clean_ai_summary({"started": False, "blocks": [],
+                                   "charCount": 0}) == "",
+          "没有内容时返回空串")
+
+    # 页面框架文案（拿不到 aimfl 锚点时的兜底过滤）
+    framed = parser.clean_ai_summary({"blocks": [
+        "跳到主要内容 无障碍功能帮助", "管理 AI 模式共享的公开链接",
+        "AI 模式历史记录", "您已退出账号", "AI 模式对话", "您发送了：1 张图片",
+        "这张图片是某部动画的宣传插画，画面里有一名角色。",
+        "See less", "分享公开链接", "此公开链接在 7 天内有效，用于分享消息串。",
+        "Facebook",
+    ], "charCount": 200})
+    check("宣传插画" in framed, "框架文案里仍能取出正文")
+    for noise in ("跳到主要内容", "您已退出账号", "您发送了", "See less",
+                  "分享公开链接", "Facebook"):
+        check(noise not in framed, f"滤掉了「{noise}」")
+
+    # AI 拒答当作没有描述
+    refused = parser.clean_ai_summary({"blocks": [
+        "抱歉，我无法提供此图片中相关内容的详细信息或进行识别。",
+    ], "charCount": 30})
+    check(refused == "", "AI 拒答被当成没有描述")
+    refused_en = parser.clean_ai_summary({"blocks": [
+        "I can't help with identifying content in this image.",
+    ], "charCount": 50})
+    check(refused_en == "", "英文拒答同样处理")
+    long_refusal = parser.clean_ai_summary({"blocks": [
+        "这张图片是某部作品的插画。" * 20 + "另外我无法提供更多细节。",
+    ], "charCount": 400})
+    check(long_refusal != "", "长正文里出现类似措辞不会被误判为拒答")
+    long_payload = {"blocks": ["句子。" * 400], "charCount": 1200}
+    check(len(parser.clean_ai_summary(long_payload, max_chars=200)) <= 210,
+          "超长描述会被截断")
+
+    # 输出：三种组合都要正常
+    match = models.ExactMatch(url="https://example.com/a", content="标题 A",
+                              source="Example")
+    both = models.LensSearchResult(exact_matches=[match],
+                                   ai_summary="这是一张示例图片。")
+    text = formatter.format_result(both, config.output)
+    check("【图片描述】" in text and "这是一张示例图片。" in text
+          and "链接: https://example.com/a" in text, "两种模式同时输出")
+    check(text.index("这是一张示例图片。") < text.index("链接:"),
+          "AI 描述排在完全匹配之前")
+
+    ai_only = models.LensSearchResult(ai_summary="只有描述。")
+    text_ai = formatter.format_result(ai_only, config.output)
+    check("只有描述。" in text_ai and "链接:" not in text_ai,
+          "只有 AI 描述时不输出空列表")
+    check(bool(ai_only) is True, "只有 AI 描述也算有结果")
+
+    exact_only = models.LensSearchResult(exact_matches=[match])
+    text_exact = formatter.format_result(exact_only, config.output)
+    check("链接: https://example.com/a" in text_exact
+          and "【图片描述】" not in text_exact, "只有完全匹配时不输出空抬头")
+
+    empty = formatter.format_result(models.LensSearchResult(), config.output)
+    check(empty == config.output.empty_text, f"两者都空 -> {empty}")
+
+    off = build_config({"search": {"exact_matches": False, "ai_mode": False}},
+                       data_dir=_StarTools.get_data_dir("modes"))
+    check(off.search.exact_matches is False and off.search.ai_mode is False,
+          "两个模式都可以关掉（运行时会报错提示）")
+
+
 async def verify_timeout_guard() -> None:
     """底层卡死时，用户必须收到回复，且会话要被重置。
 
@@ -579,6 +764,7 @@ async def main() -> int:
     verify_install_paths(plugin)
     await verify_wait_fallback(plugin)
     await verify_timeout_guard()
+    verify_result_modes(defaults)
     if args.live:
         await verify_live(plugin)
 

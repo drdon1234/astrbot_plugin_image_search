@@ -38,7 +38,13 @@ from .exceptions import ParseError, RateLimitedError
 from .loader import ImageInput, load_image
 from .logger import logger
 from .models import ExactMatch, LensSearchResult
-from .parser import EXTRACT_SCRIPT, RawMatch, extract_items
+from .parser import (
+    AI_EXTRACT_SCRIPT,
+    EXTRACT_SCRIPT,
+    RawMatch,
+    clean_ai_summary,
+    extract_items,
+)
 from .session import LensSession
 from .titles import complete_titles
 
@@ -129,12 +135,32 @@ class GoogleLensSearcher:
 
     async def _search_once(self, data: bytes, name: str, mime: str,
                            with_ocr: bool) -> LensSearchResult:
-        # 上传、切页、抽取全在浏览器里一次做完 —— vsrid 会话绑定上传方身份，
-        # 换客户端上传会让结果页显示 Expired visual search
-        payload, exact_url, location = await self._browser.upload_and_extract(
-            data, name, mime, EXTRACT_SCRIPT, debug_name="exact_matches")
-        if not isinstance(payload, dict):
+        cfg = self.config
+        # 两个模式都关掉就没有可做的事了，当成配置错误挡在这里，
+        # 不然会白跑一次上传却什么都不返回
+        if not cfg.exact_matches and not cfg.ai_mode:
+            raise ParseError(
+                "「完全匹配」和「AI 模式」都被关闭了，没有可返回的结果；"
+                "请至少开启一项")
+
+        # 上传只做一次，两个标签页共用同一个 vsrid —— vsrid 会话绑定上传方
+        # 身份，换客户端上传会让结果页显示 Expired visual search
+        outcome = await self._browser.upload_and_extract(
+            data, name, mime,
+            exact_script=EXTRACT_SCRIPT if cfg.exact_matches else None,
+            ai_script=AI_EXTRACT_SCRIPT if cfg.ai_mode else None,
+            debug_name="lens")
+
+        payload = outcome.exact_payload
+        if cfg.exact_matches and not isinstance(payload, dict):
             raise ParseError(f"页面脚本返回了意外类型: {type(payload).__name__}")
+
+        ai_summary = ""
+        if isinstance(outcome.ai_payload, dict):
+            ai_summary = clean_ai_summary(outcome.ai_payload)
+            logger.debug("AI 描述 %d 字", len(ai_summary))
+        elif cfg.ai_mode:
+            logger.debug("AI 模式没有拿到内容")
 
         ocr_text = ""
         if with_ocr:
@@ -148,18 +174,21 @@ class GoogleLensSearcher:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("OCR 获取失败，忽略: %s", exc)
 
-        raw_items = extract_items(payload, self.config.max_results)
-        matches = await self._resolve(raw_items, exact_url)
-        logger.debug("候选 %d 条，还原出 %d 条", len(raw_items), len(matches))
+        matches: list[ExactMatch] = []
+        if isinstance(payload, dict):
+            raw_items = extract_items(payload, cfg.max_results)
+            matches = await self._resolve(raw_items, outcome.exact_url)
+            logger.debug("候选 %d 条，还原出 %d 条", len(raw_items), len(matches))
 
-        if self.config.complete_titles and matches:
-            filled = await complete_titles(matches, self.config)
-            logger.debug("补全了 %d 条标题", filled)
+            if cfg.complete_titles and matches:
+                filled = await complete_titles(matches, cfg)
+                logger.debug("补全了 %d 条标题", filled)
 
         return LensSearchResult(
             exact_matches=matches,
-            result_url=exact_url,
-            lens_url=location,
+            ai_summary=ai_summary,
+            result_url=outcome.exact_url or outcome.ai_url,
+            lens_url=outcome.lens_url,
             ocr_text=ocr_text,
         )
 

@@ -48,13 +48,15 @@ class LensSearchResult:
     """一次 Lens 反搜的完整结果。"""
 
     exact_matches: list[ExactMatch] = dataclasses.field(default_factory=list)
+    ai_summary: str = ""
     result_url: str = ""
     lens_url: str = ""
     ocr_text: str = ""
     engine: str = "google_lens"
 
     def __bool__(self) -> bool:
-        return bool(self.exact_matches)
+        """有完全匹配或有 AI 描述，都算这次搜索有收获。"""
+        return bool(self.exact_matches or self.ai_summary)
 
     def __len__(self) -> int:
         return len(self.exact_matches)
@@ -65,11 +67,15 @@ class LensSearchResult:
             "result_url": self.result_url,
             "lens_url": self.lens_url,
             "ocr_text": self.ocr_text,
+            "ai_summary": self.ai_summary,
             "exact_matches": [m.to_dict() for m in self.exact_matches],
         }
 
     def format(self, limit: int = 10) -> str:
-        if not self.exact_matches:
-            return "未找到完全匹配的结果"
-        blocks = [m.format() for m in self.exact_matches[:limit]]
-        return "\n\n".join(blocks)
+        parts = []
+        if self.ai_summary:
+            parts.append(self.ai_summary)
+        if self.exact_matches:
+            parts.append("\n\n".join(m.format()
+                                     for m in self.exact_matches[:limit]))
+        return "\n\n".join(parts) if parts else "未找到完全匹配的结果"
