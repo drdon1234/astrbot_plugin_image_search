@@ -11,3 +11,5 @@ tools/_*
 # 测试素材只跟踪基准样本，其余本地素材一律不入库：
 # 代码和文档都不依赖它们，缺了不影响任何功能。
 test_imgs/*
+!test_imgs/test.png
+!test_imgs/test.gif
