@@ -924,23 +924,32 @@ async def verify_message_delivery(defaults: dict) -> None:
 
     split = formatter.format_blocks(
         result, dataclasses.replace(base, link_as_separate_message=True))
+    # 每条结果三块：序号头、标题（来源）、裸链接。序号头同时充当结果之间的分隔，
+    # 比单独插一条横线更有信息量；字段名前缀一概不要——每条已是独立气泡
     check(split[0].startswith("【图片描述】"), "拆分时描述仍独立成块")
     check("找到以下结果" in split[1], "抬头单独成块")
-    # 拆分模式下不带序号和字段名：合并转发里每条已是独立气泡，那些是噪声
-    check(split[2] == "标题一（站点一）", f"标题（来源）成一块：{split[2]!r}")
-    check(split[3] == "https://example.com/1",
-          f"链接裸放，方便长按复制：{split[3]!r}")
-    check(split[4] == base.separator, f"结果之间插分隔块：{split[4]!r}")
-    check(split[5] == "标题二（站点二）", "第二条紧随分隔块")
-    check(split[6] == "https://example.com/2", "第二条的链接也单独成块")
-    check(len(split) == 7, f"共 7 块（实际 {len(split)}）")
+    check(split[2] == "[ 结果1 ]", f"序号头成一块：{split[2]!r}")
+    check(split[3] == "标题一（站点一）", f"标题（来源）成一块：{split[3]!r}")
+    check(split[4] == "https://example.com/1",
+          f"链接裸放，方便长按复制：{split[4]!r}")
+    check(split[5] == "[ 结果2 ]", f"第二条的序号头：{split[5]!r}")
+    check(split[6] == "标题二（站点二）", "第二条的标题块")
+    check(split[7] == "https://example.com/2", "第二条的链接块")
+    check(len(split) == 8, f"描述 + 抬头 + 2×3 共 8 块（实际 {len(split)}）")
     check(not any(s.startswith(("1.", "2.", "标题:", "来源:", "链接:"))
-                  for s in split), "拆分模式下没有序号，也没有字段名前缀")
+                  for s in split), "没有字段名前缀，也没有行内序号")
+
+    # 关掉序号时连序号头一起省掉
+    no_idx = formatter.format_blocks(result, dataclasses.replace(
+        base, link_as_separate_message=True, show_index=False))
+    check(no_idx[2] == "标题一（站点一）",
+          f"关掉序号后直接是标题块：{no_idx[2]!r}")
+    check(len(no_idx) == 6, f"每条只剩两块（实际 {len(no_idx)}）")
 
     # 关掉站点名时只剩标题，不留空括号
     no_src = formatter.format_blocks(result, dataclasses.replace(
         base, link_as_separate_message=True, show_source=False))
-    check(no_src[2] == "标题一", f"不显示来源时只有标题：{no_src[2]!r}")
+    check(no_src[3] == "标题一", f"不显示来源时只有标题：{no_src[3]!r}")
 
     # 开了尺寸就一起放进括号
     sized = models.LensSearchResult(exact_matches=[
@@ -948,23 +957,24 @@ async def verify_message_delivery(defaults: dict) -> None:
                           source="站点一", width=1280, height=1796)])
     with_size = formatter.format_blocks(sized, dataclasses.replace(
         base, link_as_separate_message=True, show_size=True))
-    check(with_size[1] == "标题一（站点一 · 1280x1796）",
-          f"尺寸并入括号：{with_size[1]!r}")
+    check(with_size[2] == "标题一（站点一 · 1280x1796）",
+          f"尺寸并入括号：{with_size[2]!r}")
 
-    # 非拆分模式仍然带序号和字段名，那里需要它们来分隔
+    # 非拆分模式仍然带序号和字段名，那里所有结果挤在一个气泡里，需要它们来分隔
     check(plain[1].startswith("找到以下结果\n1. 标题: 标题一"),
           f"非拆分模式保留序号与字段名：{plain[1][:32]!r}")
+    check("[ 结果1 ]" not in plain[1], "非拆分模式不出现序号头")
 
     # 关掉合并转发时，拆分必须失效，否则普通消息会刷屏
     no_forward = formatter.format_blocks(result, dataclasses.replace(
         base, link_as_separate_message=True, use_forward_message=False))
     check(len(no_forward) == 2, f"未开合并转发时不拆分（实际 {len(no_forward)}）")
-    check(base.separator not in "".join(no_forward), "也不会插入分隔块")
+    check("[ 结果1 ]" not in "".join(no_forward), "也不会出现序号头")
 
     # format_result 面向纯文本，强制不拆分
     text = formatter.format_result(result, dataclasses.replace(
         base, link_as_separate_message=True))
-    check(base.separator not in text, "format_result 里不出现分隔块")
+    check("[ 结果1 ]" not in text, "format_result 里不出现序号头")
 
     # ---- 完全匹配没结果时要明确说出来 ----
     # 只发 AI 描述会让人分不清「这张图没被收录」和「插件没去搜完全匹配」

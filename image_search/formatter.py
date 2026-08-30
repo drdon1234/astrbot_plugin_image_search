@@ -36,12 +36,12 @@ class OutputOptions:
         link_as_separate_message: 是否把每条结果的链接单独拆成一个消息块，
             方便长按复制。只在合并转发下有意义 —— 普通消息逐条发会刷屏，
             所以 :func:`format_blocks` 里要求 ``use_forward_message`` 同时为真。
-            这个模式下每条结果是「``标题（来源）``」加「裸链接」两块，不带序号
-            和字段名（``show_index`` 因此不起作用），见
-            :func:`format_match_compact`。
+            这个模式下每条结果占三块：序号头、``标题（来源）``、裸链接。
+            序号头由 ``index_label`` 定义，同时充当结果之间的分隔。
         merge_ai_and_exact: 是否把 AI 描述和完全匹配合并进同一个块。
             和 ``use_forward_message`` 无关，两者可以任意组合。
-        separator: 拆分链接时插在结果之间的分隔块内容。
+        index_label: 拆分模式下每条结果的序号头，``{index}`` 会替换成序号。
+            受 ``show_index`` 控制，留空或关掉序号则不输出。
     """
 
     limit: int = 10
@@ -56,7 +56,7 @@ class OutputOptions:
     use_forward_message: bool = True
     link_as_separate_message: bool = False
     merge_ai_and_exact: bool = False
-    separator: str = "————————"
+    index_label: str = "[ 结果{index} ]"
 
 
 def format_match_info(match: ExactMatch, options: OutputOptions,
@@ -113,8 +113,9 @@ def _exact_blocks(result: LensSearchResult,
     if options.link_as_separate_message and options.use_forward_message:
         blocks = [head] if head else []
         for index, match in enumerate(shown, 1):
-            if index > 1 and options.separator:
-                blocks.append(options.separator)
+            # 序号头同时充当结果之间的分隔，比单独插一条横线更有信息量
+            if options.show_index and options.index_label:
+                blocks.append(options.index_label.format(index=index))
             blocks.append(format_match_compact(match, options))
             # 链接裸放，前面加 “链接:” 会让长按复制多带一截
             blocks.append(match.url)
