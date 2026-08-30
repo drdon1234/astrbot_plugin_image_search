@@ -36,6 +36,9 @@ class OutputOptions:
         link_as_separate_message: 是否把每条结果的链接单独拆成一个消息块，
             方便长按复制。只在合并转发下有意义 —— 普通消息逐条发会刷屏，
             所以 :func:`format_blocks` 里要求 ``use_forward_message`` 同时为真。
+            这个模式下每条结果是「``标题（来源）``」加「裸链接」两块，不带序号
+            和字段名（``show_index`` 因此不起作用），见
+            :func:`format_match_compact`。
         merge_ai_and_exact: 是否把 AI 描述和完全匹配合并进同一个块。
             和 ``use_forward_message`` 无关，两者可以任意组合。
         separator: 拆分链接时插在结果之间的分隔块内容。
@@ -80,6 +83,22 @@ def format_match(match: ExactMatch, options: OutputOptions,
             f"{format_match_link(match)}")
 
 
+def format_match_compact(match: ExactMatch, options: OutputOptions) -> str:
+    """拆分模式下的标题块：``标题（来源）``。
+
+    不带序号，也不带 ``标题:`` / ``来源:`` 这些字段名 —— 每条结果在合并转发里
+    已经是独立气泡，顺序和归属一眼就能看出来，字段名只是噪声。
+    """
+    extras: list[str] = []
+    if options.show_source and match.source:
+        extras.append(match.source)
+    if options.show_size and match.width and match.height:
+        extras.append(f"{match.width}x{match.height}")
+    if extras:
+        return f"{match.content}（{' · '.join(extras)}）"
+    return match.content
+
+
 def _exact_blocks(result: LensSearchResult,
                   options: OutputOptions) -> list[str]:
     """把完全匹配部分拆成消息块。"""
@@ -96,8 +115,9 @@ def _exact_blocks(result: LensSearchResult,
         for index, match in enumerate(shown, 1):
             if index > 1 and options.separator:
                 blocks.append(options.separator)
-            blocks.append(format_match_info(match, options, index))
-            blocks.append(format_match_link(match))
+            blocks.append(format_match_compact(match, options))
+            # 链接裸放，前面加 “链接:” 会让长按复制多带一截
+            blocks.append(match.url)
         return blocks
 
     body = "\n\n".join(format_match(m, options, i)

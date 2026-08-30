@@ -309,7 +309,7 @@ AI 模式另有一套，分工是「浏览器只定位，Python 做判断」：
   | 开关 | 作用 |
   | --- | --- |
   | `merge_ai_and_exact` | AI 描述是否并入完全匹配的第一块。与合并转发无关 |
-  | `link_as_separate_message` | 每条结果拆成「标题+来源」「链接」两块，结果间插分隔块。**仅在合并转发下生效** —— 普通消息逐条发会刷屏，所以 `format_blocks()` 里要求 `use_forward_message` 同时为真 |
+  | `link_as_separate_message` | 每条结果拆成「`标题（来源）`」「裸链接」两块，结果间插分隔块。此模式不输出序号与字段名（`show_index` 因此失效）—— 每条已是独立气泡，字段名是噪声，链接带前缀还会让长按复制多带一截。**仅在合并转发下生效** —— 普通消息逐条发会刷屏，所以 `format_blocks()` 里要求 `use_forward_message` 同时为真 |
   | `use_forward_message` | 由 `main.py` 消费：真则打包成一条合并转发，假则逐块发普通消息 |
 - `models.py`：`ExactMatch` 提供 `truncated` 属性与 `format()`；`LensSearchResult`
   实现 `__bool__` 与 `__len__`，可直接用于真值判断

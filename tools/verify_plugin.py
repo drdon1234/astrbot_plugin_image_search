@@ -926,14 +926,34 @@ async def verify_message_delivery(defaults: dict) -> None:
         result, dataclasses.replace(base, link_as_separate_message=True))
     check(split[0].startswith("【图片描述】"), "拆分时描述仍独立成块")
     check("找到以下结果" in split[1], "抬头单独成块")
-    check(split[2].startswith("1. 标题: 标题一") and "来源: 站点一" in split[2],
-          f"标题与来源同块：{split[2]!r}")
-    check(split[3] == "链接: https://example.com/1",
-          f"链接单独成块：{split[3]!r}")
+    # 拆分模式下不带序号和字段名：合并转发里每条已是独立气泡，那些是噪声
+    check(split[2] == "标题一（站点一）", f"标题（来源）成一块：{split[2]!r}")
+    check(split[3] == "https://example.com/1",
+          f"链接裸放，方便长按复制：{split[3]!r}")
     check(split[4] == base.separator, f"结果之间插分隔块：{split[4]!r}")
-    check(split[5].startswith("2. 标题: 标题二"), "第二条紧随分隔块")
-    check(split[6] == "链接: https://example.com/2", "第二条的链接也单独成块")
+    check(split[5] == "标题二（站点二）", "第二条紧随分隔块")
+    check(split[6] == "https://example.com/2", "第二条的链接也单独成块")
     check(len(split) == 7, f"共 7 块（实际 {len(split)}）")
+    check(not any(s.startswith(("1.", "2.", "标题:", "来源:", "链接:"))
+                  for s in split), "拆分模式下没有序号，也没有字段名前缀")
+
+    # 关掉站点名时只剩标题，不留空括号
+    no_src = formatter.format_blocks(result, dataclasses.replace(
+        base, link_as_separate_message=True, show_source=False))
+    check(no_src[2] == "标题一", f"不显示来源时只有标题：{no_src[2]!r}")
+
+    # 开了尺寸就一起放进括号
+    sized = models.LensSearchResult(exact_matches=[
+        models.ExactMatch(url="https://example.com/1", content="标题一",
+                          source="站点一", width=1280, height=1796)])
+    with_size = formatter.format_blocks(sized, dataclasses.replace(
+        base, link_as_separate_message=True, show_size=True))
+    check(with_size[1] == "标题一（站点一 · 1280x1796）",
+          f"尺寸并入括号：{with_size[1]!r}")
+
+    # 非拆分模式仍然带序号和字段名，那里需要它们来分隔
+    check(plain[1].startswith("找到以下结果\n1. 标题: 标题一"),
+          f"非拆分模式保留序号与字段名：{plain[1][:32]!r}")
 
     # 关掉合并转发时，拆分必须失效，否则普通消息会刷屏
     no_forward = formatter.format_blocks(result, dataclasses.replace(
