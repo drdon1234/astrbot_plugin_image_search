@@ -27,6 +27,7 @@ import importlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -808,6 +809,51 @@ def _install_session_waiter_stub(picked_image) -> list:
     return follow_ups
 
 
+def verify_trigger_pattern() -> None:
+    """触发条件：群聊里不 @ 机器人也要能触发，且不能被闲聊误触发。
+
+    对应过的真实故障：群聊中三种写法（``@bot 搜图`` / ``@bot /搜图`` /
+    引用图片发 ``搜图``）全部无响应，只有私聊能用。根因是 ``CommandFilter``
+    要求 ``is_at_or_wake_command`` 为真、且 ``message_str`` 以指令名开头，
+    而群里引用别人的图时既没有 @ 也没有前缀。
+    """
+    print("16) 触发条件（群聊 / 引用 / @ / 前缀）")
+    main_module = importlib.import_module(f"{PACKAGE_NAME}.main")
+    trigger = re.compile(main_module.TRIGGER_PATTERN)
+    status = re.compile(main_module.STATUS_PATTERN)
+
+    for text in (
+        "搜图",                                  # 群里引用图片直接发，没有 @
+        " 搜图 ",
+        "/搜图",
+        "／搜图",                                # 全角斜杠
+        "@新一代finisher(2811292152) 搜图",       # @ 机器人后残留的提及文本
+        "@新一代finisher(2811292152) /搜图",
+        " @新一代 finisher(2811292152)  搜图",    # 昵称里有空格
+        "@甲(1) @乙(22) 搜图",                    # 多个 @
+        "以图搜图",
+        "soutu",
+        "SAUCE",                                # 英文别名不区分大小写
+    ):
+        check(bool(trigger.search(text.strip())), f"能触发：{text!r}")
+
+    for text in (
+        "搜图很好用",
+        "帮我搜图",
+        "搜图状态",                              # 归另一个指令
+        "搜索图片",
+        "这张图我搜图过了",
+        "@新一代finisher(2811292152) 在吗",
+        "",
+    ):
+        check(not trigger.search(text.strip()), f"不误触发：{text!r}")
+
+    check(bool(status.search("搜图状态")), "状态指令可触发")
+    check(bool(status.search("@新一代finisher(2811292152) /搜图状态")),
+          "状态指令支持 @ 与前缀")
+    check(not status.search("搜图"), "搜图不会触发状态指令")
+
+
 async def verify_message_delivery(defaults: dict) -> None:
     """消息投递：等待补图后必须仍能发出结果，以及各种拆分/合并组合。"""
     print("15) 消息投递（合并转发 / 拆分 / 补图后仍能回复）")
@@ -1033,6 +1079,7 @@ async def main() -> int:
     await verify_wait_fallback(plugin)
     await verify_timeout_guard()
     verify_result_modes(defaults)
+    verify_trigger_pattern()
     # 放在最后：它会注入 session_waiter 桩，而第 11 节要验证「没有它」的降级
     await verify_message_delivery(defaults)
     if args.live:

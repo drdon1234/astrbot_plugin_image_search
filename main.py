@@ -1,10 +1,13 @@
 """AstrBot 插件入口：Google Lens 反向搜图。
 
-用法（默认指令 ``搜图``）：
+用法（指令 ``搜图``，别名 ``以图搜图`` / ``soutu`` / ``sauce``，``/`` 前缀可选）：
 
-* ``/搜图`` 并在同一条消息里带图片
-* 引用一条带图片的消息，回复 ``/搜图``
-* 只发 ``/搜图``，然后在超时时间内补发图片
+* ``搜图`` 并在同一条消息里带图片
+* 引用一条带图片的消息，回复 ``搜图``
+* 只发 ``搜图``，然后在超时时间内补发图片
+
+群聊和私聊都不需要 @ 机器人。触发条件走正则而不是 ``@filter.command``，
+原因见 :data:`TRIGGER_PATTERN` 上方的注释。
 
 搜索逻辑全在 ``image_search`` 包里，这里只负责：取图、调服务、拼消息、
 管生命周期。
@@ -31,6 +34,33 @@ from .image_search.plugin_config import build_config
 from .image_search.service import LensSearchService
 
 PLUGIN_NAME = "astrbot_plugin_image_search"
+
+# 触发条件用正则而不是 @filter.command，否则群聊里根本进不来。CommandFilter 有
+# 两道卡口（AstrBot 4.27 实测）：
+#
+# 1. ``if not event.is_at_or_wake_command: return False``。这个标志只在 @ 机器人、
+#    带 wake_prefix、引用机器人自己的消息、或私聊时才为真。而最常用的形态是
+#    「引用群友发的图 + 搜图」，既没 @ 也没前缀，标志为假，指令直接被跳过。
+# 2. 要求 ``message_str`` 以指令名开头。群里 @ 机器人时，message_str 前面可能
+#    还留着「@昵称(QQ号)」，开头对不上。
+#
+# RegexFilter 两条都不受约束（源码注释写明「不会受到 wake_prefix 的制约」），而且
+# filter 通过本身就会把事件标记为已唤醒，所以群聊里不 @ 也能触发。
+# 代价是要自己写全别名和前缀，并且用 ^...$ 收紧边界，避免聊天里提到「搜图」就误触发。
+
+#: 群聊 @ 机器人后 message_str 里可能残留的提及文本，形如「@昵称(QQ号) 」
+_MENTION_PREFIX = r"(?:\s*@[^@]*?\(\d+\)\s*)*"
+#: 可选的指令前缀，全角半角都认
+_COMMAND_PREFIX = r"\s*[/／]?\s*"
+
+#: 触发搜图。``(?i)`` 让英文别名不区分大小写，对中文无影响
+TRIGGER_PATTERN = (
+    rf"(?i)^{_MENTION_PREFIX}{_COMMAND_PREFIX}"
+    r"(?:搜图|以图搜图|soutu|sauce)\s*$")
+#: 查看浏览器状态（管理员）
+STATUS_PATTERN = (
+    rf"(?i)^{_MENTION_PREFIX}{_COMMAND_PREFIX}"
+    r"(?:搜图状态|soutu_status)\s*$")
 
 
 @register(
@@ -112,7 +142,7 @@ class ImageSearchPlugin(Star):
         logger.info("%s 已卸载，浏览器已关闭", PLUGIN_NAME)
 
     # -- 指令 ---------------------------------------------------------------
-    @filter.command("搜图", alias={"soutu", "sauce", "以图搜图"})
+    @filter.regex(TRIGGER_PATTERN)
     async def search_image(self, event: AstrMessageEvent):
         """用 Google Lens 反搜图片来源。
 
@@ -330,7 +360,7 @@ class ImageSearchPlugin(Star):
 
         return picked[0] if picked else None
 
-    @filter.command("搜图状态", alias={"soutu_status"})
+    @filter.regex(STATUS_PATTERN)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def search_status(self, event: AstrMessageEvent):
         """查看浏览器状态，缺失时触发安装。"""
