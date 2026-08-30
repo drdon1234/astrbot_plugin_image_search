@@ -700,34 +700,39 @@ def verify_result_modes(defaults: dict) -> None:
         ai_page('<div data-hveid="a">' + "句子。" * 400 + '</div>'),
         max_chars=200)) <= 210, "超长描述会被截断")
 
-    # ---- 结尾的提问按标点丢弃：只看问号和位置，不猜措辞 ----
-    tail_q = parser.ai_html_to_text(ai_page(
+    # ---- 没有网格时，AI 回答原样保留，不做任何剔除 ----
+    # 追问和正文在结构上分不开，按措辞或标点去猜都不够稳：网格出现率只有一半，
+    # 剩下那半里追问的收尾形态还在「问句」和「引导语 + 列表」之间随机切换。
+    # 既然分不可靠就不分，宁可多几行说明文字，也不冒误删正文的风险。
+    verbatim = parser.ai_html_to_text(ai_page(
         '<div data-hveid="a">这是正文描述。</div>'
         '<div data-hveid="b">你想进一步了解哪方面的内容呢？</div>'))
-    check(tail_q == "这是正文描述。", f"结尾整行问句被丢弃：{tail_q!r}")
+    check(verbatim == "这是正文描述。\n你想进一步了解哪方面的内容呢？",
+          f"结尾提问原样保留：{verbatim!r}")
 
-    multi_q = parser.ai_html_to_text(ai_page(
-        '<div data-hveid="a">正文一句。</div>'
-        '<div data-hveid="b">要看高清壁纸吗？</div>'
-        '<div data-hveid="c">Would you like more details?</div>'))
-    check(multi_q == "正文一句。", f"连续问句一并丢弃（含英文）：{multi_q!r}")
-
-    mixed_q = parser.ai_html_to_text(ai_page(
-        '<div data-hveid="a">她拥有粉色长发。你想了解更多吗？</div>'))
-    check(mixed_q == "她拥有粉色长发。", f"只砍行内末尾那句：{mixed_q!r}")
-
-    # 问号不在结尾时不受影响 —— 规则只从最后一行往前扫
-    inner_q = parser.ai_html_to_text(ai_page(
-        '<div data-hveid="a">这幅画的标题是《你在吗？》。</div>'
-        '<div data-hveid="b">它出自某位画师之手。</div>'))
-    check("《你在吗？》" in inner_q and "出自某位画师" in inner_q,
-          f"正文中间的问号保留：{inner_q!r}")
-
-    # 陈述句收尾的邀请语留得住，这是这条规则明确的取舍
-    kept = parser.ai_html_to_text(ai_page(
+    invite = parser.ai_html_to_text(ai_page(
         '<div data-hveid="a">这是正文。</div>'
-        '<div data-hveid="b">请告诉我你接下来想了解的内容。</div>'))
-    check("请告诉我" in kept, "句号收尾的邀请语不删（宁可多留，不赌措辞）")
+        '<div data-hveid="b">如果你想了解更多，我可以为你提供：</div>'
+        '<ul><li><span>高清壁纸</span></li>'
+        '<li><span>剧情简介</span></li></ul>'
+        '<div data-hveid="c">请告诉我你接下来想了解的内容。</div>'))
+    check("如果你想了解更多" in invite and "• 高清壁纸" in invite
+          and "请告诉我" in invite, f"追问建议整块保留：{invite!r}")
+
+    # 但网格必须照旧截断 —— 那是几十个站点名，纯噪声
+    grid_still = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">正文段落。</div>' + grid + followup))
+    check("正文段落。" in grid_still, "正文保留")
+    for index in range(6):
+        check(f"站点名{index}" not in grid_still,
+              f"网格仍被丢弃：站点名{index}")
+    check("经典台词" not in grid_still, "网格之后的内容仍被丢弃")
+
+    # 网格删掉后悬空的冒号断尾仍要补掉，否则结尾指向一个已不存在的东西
+    dangling = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">她拥有粉色长发。以下是更多相关内容：</div>'
+        + grid))
+    check(dangling == "她拥有粉色长发。", f"冒号断尾被补掉：{dangling!r}")
 
     # 输出：三种组合都要正常
     match = models.ExactMatch(url="https://example.com/a", content="标题 A",

@@ -344,42 +344,6 @@ def _truncate_at_related_grid(root: Any) -> bool:
 
 
 _SENTENCE_END = ("。", "！", "!", "？", "?", "；", ";", ".")
-# 句子边界：中文句读，以及后面跟空白的英文句点
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；!?;])|(?<=\.)(?=\s)")
-_QUESTION_MARKS = ("？", "?")
-
-
-def _drop_trailing_questions(lines: list[str]) -> None:
-    """丢掉结尾的问句。
-
-    AI 习惯在回答末尾追一句「你想进一步了解哪方面的内容呢？」这类邀请继续
-    对话的提问，对搜图没有意义。判据只有位置和标点：从最后一行往前，末句以
-    问号收尾就丢掉，遇到不是问句的立刻停。
-
-    这么定是因为追问和正文在 DOM 结构上确实分不开（见 DESIGN_NOTES 2.10），
-    而按措辞去匹配又太脆弱 —— 回答语言由 Google 按出口 IP 判定，换个节点就
-    从中文变英文，话术也跟着换。问号是标点，不是措辞：描述一张图片的正文是
-    客观陈述，不会以问号结尾，所以这条规则对语言和说法都不敏感。
-
-    代价是句号或感叹号收尾的邀请语（「请告诉我你接下来想了解的内容。」）留
-    得住。宁可多留一句，也不去赌措辞把正文删掉。
-
-    一行里可能前半是正文、后半才是提问，所以按句切开处理，只砍末尾那几句。
-    """
-    while lines:
-        sentences = [s for s in _SENTENCE_SPLIT_RE.split(lines[-1]) if s]
-        dropped = False
-        while sentences and sentences[-1].rstrip().endswith(_QUESTION_MARKS):
-            sentences.pop()
-            dropped = True
-        if not dropped:
-            break
-        rest = "".join(sentences).strip()
-        if rest:
-            # 这一行还剩正文，砍到这里为止
-            lines[-1] = rest
-            break
-        lines.pop()
 
 
 def _trim_dangling_tail(lines: list[str]) -> None:
@@ -417,9 +381,16 @@ def ai_html_to_text(html: str, max_chars: int = 900) -> str:
     万一版面变了、网格认不出来，结果是多输出几行追问建议，而不是把正文
     截断或者丢掉 —— 宁可多给，不能少给。
 
-    AI 对部分图片会拒答，而且同一张图不是每次都拒。拒答文案
-    没有信息量，留着只会在结果里多出一句「抱歉」，所以整段丢掉，让输出只保留
-    完全匹配那部分。
+    **追问建议和结尾提问一律原样保留。** 试过按结构分（``data-hveid``、
+    ``data-sae``、嵌套层级都一样）、按引导语的冒号分、按条目是否问句分、按结尾
+    问句的标点分，没有一个既清得干净又不误伤正文：网格出现率只有一半，剩下那
+    半里追问的收尾形态还在「问句」和「引导语 + 列表」之间随机切换。既然分不
+    可靠，就不分 —— 原样搬运 AI 的回答，多几行说明文字用户一眼能忽略，少了正文
+    却看不出来。取舍过程见 DESIGN_NOTES 2.10。
+
+    AI 对部分图片会拒答，而且同一张图不是每次都拒。拒答文案没有信息量，留着
+    只会在结果里多出一句「抱歉」，所以整段丢掉，让输出只保留完全匹配那部分。
+    这是这里唯一还看措辞的地方 —— 「拒答」只能从语义上认。
     """
     if not html:
         return ""
@@ -471,8 +442,8 @@ def ai_html_to_text(html: str, max_chars: int = 900) -> str:
         seen.add(text)
         lines.append(text)
 
-    # 先剔结尾问句，再处理冒号断尾 —— 删掉问句可能露出新的断尾引导语
-    _drop_trailing_questions(lines)
+    # 只补掉网格被删后悬空的冒号断尾。追问建议、结尾提问一律原样保留 ——
+    # 它们和正文在结构上分不开，靠措辞或标点去猜都不够稳（见 DESIGN_NOTES 2.10）
     _trim_dangling_tail(lines)
     summary = "\n".join(lines).strip()
     if summary and _AI_REFUSAL_RE.search(summary) and len(summary) < 200:
