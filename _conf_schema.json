@@ -137,6 +137,27 @@
                 "type": "bool",
                 "default": false
             },
+            "use_forward_message": {
+                "description": "使用合并转发消息",
+                "type": "bool",
+                "hint": "把结果打包成一条合并转发，点开才看到内容，不占聊天记录。关闭后按块逐条发送普通消息。搜图结果由插件直接投递，不受 AstrBot 全局设置里「转发消息的字数阈值」和「回复时引用发送人消息」的影响——否则结果会因为字数偶尔越过阈值而时折叠时不折叠。",
+                "default": true
+            },
+            "merge_ai_and_exact": {
+                "description": "合并图片描述与完全匹配",
+                "type": "bool",
+                "hint": "开启后两类结果放在同一条消息（或同一个转发节点）里；关闭则各自独立。与「使用合并转发消息」互不影响，可任意组合。",
+                "default": false
+            },
+            "link_as_separate_message": {
+                "description": "链接单独成一条消息",
+                "type": "bool",
+                "hint": "把每条结果的链接拆成独立消息，方便长按复制：标题与来源一条、链接一条，结果之间插一条横线分隔。仅在开启「使用合并转发消息」时生效——普通消息下逐条发送会刷屏。",
+                "condition": {
+                    "use_forward_message": true
+                },
+                "default": false
+            },
             "working_hint": {
                 "description": "开始搜索时的提示语",
                 "type": "string",

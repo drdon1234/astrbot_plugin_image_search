@@ -108,11 +108,20 @@ HTTP 会话，由 `LensSession` 承担，与浏览器流程互不影响。
 - 注册 LLM 函数工具 `reverse_image_search`，参数为图片 http(s) 地址
 - `_pick_image()` 从当前消息或被引用消息中取第一张图；取不到时经
   `_wait_for_image()` 等待补发，该路径依赖 `session_waiter`，旧版本 AstrBot 上会
-  降级为提示文案
+  降级为提示文案。**`stop_event()` 只能作用于补发图片那条消息的事件**，若作用于
+  原指令事件会导致后续结果无法送出，原因见 DESIGN_NOTES 7.1
 - `_check_cooldown()` 按 `会话 + 发送者` 维度限流，时间戳在指令**开始时**记录，
   字典超过 256 项时清理过期记录
-- `_run_search()` 将 `RateLimitedError` / `BrowserNotAvailableError` /
-  `ImageSearchError` / 未预期异常分别转成文案
+- `_search()` 将 `RateLimitedError` / `BrowserNotAvailableError` /
+  `ImageSearchError` / 未预期异常分别转成文案，成功则返回结果对象；
+  `_run_search()` 在其上再包一层，返回拼好的纯文本，供 LLM 工具与校验脚本使用
+- `_send_result()` 按配置投递：`use_forward_message` 为真时把
+  `format_blocks()` 的每一块包成一个 `Node`、整体作为 `Nodes` 发出；为假则逐块
+  发普通消息。合并转发是 QQ 特有能力，其他平台会抛异常，此时回退为普通消息
+- **全程使用 `event.send()` 而非 `yield`**。`yield` 出去的结果要经过
+  `result_decorate` 阶段，那里会按全局配置 `forward_threshold`（默认 1500 字）
+  把长消息折叠成合并转发、按 `reply_with_quote` 加引用，导致同一指令的呈现方式
+  随结果字数漂移；`event.send()` 直连平台适配器，绕过该阶段。详见 DESIGN_NOTES 7.2
 - `terminate()` 取消后台安装任务并关闭服务
 
 ### 2.2 配置映射 `image_search/plugin_config.py`
@@ -273,7 +282,10 @@ AI 模式另有一套，分工是「浏览器只定位，Python 做判断」：
    引用来源胶囊（`<button>`）、`[aria-hidden="true"]`、图片
 3. 按标签语义转文本：`role="heading"` 与 `h1`~`h6` 当小标题前后留空行，`li`
    加项目符号，`<table>` 的行转成「字段：值」或竖线分隔，其余块级元素各占一行
-4. `_trim_dangling_tail()` 削掉「以下是更多相关内容：」这类因网格被删而悬空的
+4. `_drop_trailing_questions()` 丢掉结尾的问句（AI 惯用的「你想进一步了解哪方面
+   的内容呢？」）。只看位置与标点：从最后一行往前，末句以问号收尾即丢弃，遇到
+   非问句立即停止，并按句切分以保留同一行内的正文
+5. `_trim_dangling_tail()` 削掉「以下是更多相关内容：」这类因网格被删而悬空的
    冒号断尾
 
 截断必须发生在删噪之前 —— 网格里的内容大半带隐藏标记，删噪后它就是个空 `div`。
@@ -284,9 +296,20 @@ AI 模式另有一套，分工是「浏览器只定位，Python 做判断」：
 
 - `titles.py`：`complete_titles()` 抓取目标页 `<title>` 补全被截断的标题。仅当目标页
   标题以截断前缀开头时才替换，避免把跳转首页或反爬页的标题写进结果
-- `formatter.py`：`format_result()` / `format_match()` 按 `链接` / `标题` 两行输出，
-  可选附加 `来源` 与 `尺寸`。插件与本地脚本共用，保证两处输出一致。注意展示标签与
-  `ExactMatch` 的字段名（`url` / `content` / `source`）是两回事，改文案不影响字段
+- `formatter.py`：输出分两层。`format_blocks()` 把结果拆成**独立的消息块列表**，
+  拆分粒度由 `OutputOptions` 控制；`format_result()` 把这些块用空行拼成一段文本，
+  供本地脚本与 LLM 工具使用（它强制不拆链接，免得分隔块变成正文里的横线）。
+  单条结果按 `标题` / `来源` /（可选 `尺寸`）/ `链接` 排列，链接固定在最后一行
+  方便复制。插件与本地脚本共用同一套逻辑。注意展示标签与 `ExactMatch` 的字段名
+  （`url` / `content` / `source`）是两回事，改文案不影响字段
+
+  三个开关的组合语义：
+
+  | 开关 | 作用 |
+  | --- | --- |
+  | `merge_ai_and_exact` | AI 描述是否并入完全匹配的第一块。与合并转发无关 |
+  | `link_as_separate_message` | 每条结果拆成「标题+来源」「链接」两块，结果间插分隔块。**仅在合并转发下生效** —— 普通消息逐条发会刷屏，所以 `format_blocks()` 里要求 `use_forward_message` 同时为真 |
+  | `use_forward_message` | 由 `main.py` 消费：真则打包成一条合并转发，假则逐块发普通消息 |
 - `models.py`：`ExactMatch` 提供 `truncated` 属性与 `format()`；`LensSearchResult`
   实现 `__bool__` 与 `__len__`，可直接用于真值判断
 - `logger.py`：优先使用 AstrBot 的 logger，独立运行时回退标准库。另提供

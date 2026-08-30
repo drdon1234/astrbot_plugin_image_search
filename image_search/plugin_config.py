@@ -135,6 +135,11 @@ def build_config(raw: Mapping[str, Any] | None,
         show_index=_bool(output_raw.get("show_index"), True),
         show_ocr=_bool(search_raw.get("with_ocr"), False),
         empty_text=_text(output_raw.get("empty_text"), "没有找到完全匹配的结果"),
+        expect_exact_matches=_bool(search_raw.get("exact_matches"), True),
+        use_forward_message=_bool(output_raw.get("use_forward_message"), True),
+        link_as_separate_message=_bool(
+            output_raw.get("link_as_separate_message"), False),
+        merge_ai_and_exact=_bool(output_raw.get("merge_ai_and_exact"), False),
     )
 
     options = PluginOptions(

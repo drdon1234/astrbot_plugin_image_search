@@ -16,7 +16,7 @@ import asyncio
 import time
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image, Reply
+from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .image_search.exceptions import (
@@ -24,8 +24,9 @@ from .image_search.exceptions import (
     ImageSearchError,
     RateLimitedError,
 )
-from .image_search.formatter import format_result
+from .image_search.formatter import format_blocks, format_result
 from .image_search.logger import logger
+from .image_search.models import LensSearchResult
 from .image_search.plugin_config import build_config
 from .image_search.service import LensSearchService
 
@@ -113,43 +114,92 @@ class ImageSearchPlugin(Star):
     # -- 指令 ---------------------------------------------------------------
     @filter.command("搜图", alias={"soutu", "sauce", "以图搜图"})
     async def search_image(self, event: AstrMessageEvent):
-        """用 Google Lens 反搜图片来源。"""
+        """用 Google Lens 反搜图片来源。
+
+        全程用 ``event.send()`` 主动发送，不走 ``yield``。两个原因：
+
+        1. 结果可能要分成多条消息，而 AstrBot 的 pipeline 在每个 ``yield``
+           之间都会检查 ``event.is_stopped()``，一旦事件被终止，后面 yield
+           出去的内容就直接丢了。主动发送不受这个状态影响。
+        2. ``yield`` 出去的结果要经过 ``result_decorate`` 阶段，那里会按全局
+           配置 ``platform_settings.forward_threshold``（默认 1500 字）把长消息
+           折叠成合并转发，还会按 ``reply_with_quote`` 加引用。搜图结果的字数
+           随描述长短和条数浮动，正好在阈值附近来回，于是同一个指令时而被折叠
+           时而不被折叠。``event.send()`` 直连平台适配器，绕过整个装饰阶段，
+           要不要合并转发完全由本插件的配置说了算。
+        """
         limited = self._check_cooldown(event)
         if limited:
-            yield event.plain_result(limited)
+            await event.send(event.plain_result(limited))
             return
 
         # 浏览器还在后台装的时候，给个明确的进度而不是一句失败
         if not self.service.browser_ready():
             self._schedule_prepare()
-            yield event.plain_result(
-                f"{self.service.install_status()}\n装好后再发一次就行。")
+            await event.send(event.plain_result(
+                f"{self.service.install_status()}\n装好后再发一次就行。"))
             return
 
         image = self._pick_image(event)
         if image is None:
-            waited = await self._wait_for_image(event)
-            if waited is None:
+            image = await self._wait_for_image(event)
+            if image is None:
                 return
-            image = waited
 
         hint = self.config.options.working_hint
         if hint:
-            yield event.plain_result(hint)
+            await event.send(event.plain_result(hint))
 
         try:
             payload = await image.convert_to_file_path()
         except Exception as exc:  # noqa: BLE001
             logger.warning("获取图片失败: %s", exc)
-            yield event.plain_result("拿不到这张图片，换一张再试试")
+            await event.send(event.plain_result("拿不到这张图片，换一张再试试"))
             return
 
-        text = await self._run_search(payload)
-        yield event.plain_result(text)
+        outcome = await self._search(payload)
+        if isinstance(outcome, str):
+            await event.send(event.plain_result(outcome))
+            return
+        await self._send_result(event, outcome)
+
+    async def _send_result(self, event: AstrMessageEvent,
+                           result: LensSearchResult) -> None:
+        """按配置把结果发出去：一条合并转发，或者逐块发普通消息。"""
+        blocks = format_blocks(result, self.config.output)
+        if self.config.output.use_forward_message:
+            name, uin = self._forward_identity(event)
+            nodes = [Node(name=name, uin=uin, content=[Plain(block)])
+                     for block in blocks]
+            try:
+                await event.send(event.chain_result([Nodes(nodes)]))
+                return
+            except Exception as exc:  # noqa: BLE001
+                # 合并转发是 QQ 特有的，其它平台会失败。回退成普通消息，
+                # 总比什么都收不到好。
+                logger.warning("合并转发发送失败，回退为普通消息: %s", exc)
+        for block in blocks:
+            await event.send(event.plain_result(block))
+
+    def _forward_identity(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """合并转发里每个节点显示的发送者。取不到 id 就用占位值。"""
+        try:
+            uin = str(event.get_self_id() or "0")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("取机器人自身 id 失败: %s", exc)
+            uin = "0"
+        return self.config.options.command, uin
 
     # -- 内部实现 -----------------------------------------------------------
     async def _run_search(self, image_path: str) -> str:
-        """执行搜索并把结果和各类失败都转成可直接发送的文本。
+        """搜索并把结果拼成一段文本。给 LLM 工具和校验脚本用。"""
+        outcome = await self._search(image_path)
+        if isinstance(outcome, str):
+            return outcome
+        return format_result(outcome, self.config.output)
+
+    async def _search(self, image_path: str) -> LensSearchResult | str:
+        """执行搜索。成功返回结果对象，失败返回可直接发送的错误文案。
 
         整个搜索套了一层总超时。底层卡死时用户必须能收到明确回复 —— 实测过一种
         情况：AstrBot 运行期间 pip 升级了 playwright，旧客户端配新 driver 会让
@@ -183,7 +233,7 @@ class ImageSearchPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.exception("搜图出现未预期的错误: %s", exc)
             return "搜索出错了，详情见 AstrBot 日志"
-        return format_result(result, self.config.output)
+        return result
 
     async def _force_close(self) -> None:
         """强制释放浏览器会话，让下一次搜索从干净状态重新开始。
@@ -260,6 +310,13 @@ class ImageSearchPlugin(Star):
                 controller.keep(timeout=seconds, reset_timeout=True)
                 return
             picked.append(images[0])
+            # 只终止补图那条消息的传播，别让它再去触发别的插件。
+            #
+            # 这里绝对不能动原来那个指令事件：``stop_event()`` 会把
+            # ``_force_stopped`` 永久置位，而 AstrBot 的 pipeline 在每次
+            # ``yield`` 之后都检查 ``is_stopped()``，一旦置位，后面产出的结果
+            # 就再也发不出去 —— 表现为用户只收到「正在搜索」，然后没有下文。
+            next_event.stop_event()
             controller.stop()
 
         try:
@@ -270,8 +327,6 @@ class ImageSearchPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("等待图片时出错: %s", exc)
             return None
-        finally:
-            event.stop_event()
 
         return picked[0] if picked else None
 
@@ -280,17 +335,21 @@ class ImageSearchPlugin(Star):
     async def search_status(self, event: AstrMessageEvent):
         """查看浏览器状态，缺失时触发安装。"""
         ready = self.service.browser_ready()
+        output = self.config.output
         lines = [
             f"浏览器: {'已就绪' if ready else '缺失'}",
             f"安装状态: {self.service.install_status()}",
             f"浏览器进程: {'运行中' if self.service.running else '未启动'}",
             f"代理: {self.config.search.proxy or '未配置（直连）'}",
             f"自动安装: {'开' if self.config.search.auto_install_browser else '关'}",
+            f"合并转发: {'开' if output.use_forward_message else '关'}"
+            f"　链接单独成条: {'开' if output.link_as_separate_message else '关'}"
+            f"　描述与结果合并: {'开' if output.merge_ai_and_exact else '关'}",
         ]
         if not ready:
             self._schedule_prepare()
             lines.append("已触发后台安装，稍后再查。")
-        yield event.plain_result("\n".join(lines))
+        await event.send(event.plain_result("\n".join(lines)))
 
     # -- 给 LLM 用的函数工具 -------------------------------------------------
     @filter.llm_tool(name="reverse_image_search")

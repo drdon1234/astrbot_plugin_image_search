@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import importlib
 import json
 import os
@@ -85,6 +86,24 @@ class _Plain:
         self.text = text
 
 
+class _Node:
+    """对齐 astrbot.api.message_components.Node（合并转发的单个节点）。"""
+
+    def __init__(self, content=None, name: str = "", uin: str = "0") -> None:
+        self.content = content or []
+        self.name = name
+        self.uin = uin
+
+    @property
+    def text(self) -> str:
+        return "".join(getattr(c, "text", "") for c in self.content)
+
+
+class _Nodes:
+    def __init__(self, nodes=None) -> None:
+        self.nodes = nodes or []
+
+
 class _Star:
     def __init__(self, context=None) -> None:
         self.context = context
@@ -119,11 +138,30 @@ class _Event:
     def plain_result(self, text: str) -> str:
         return text
 
+    def chain_result(self, chain: list):
+        return chain
+
+    def get_self_id(self) -> str:
+        return "bot-self-id"
+
     async def send(self, result) -> None:
         self.sent.append(result)
 
     def stop_event(self) -> None:
         self.stopped = True
+
+    @property
+    def forwarded(self) -> list:
+        """发出去的合并转发节点（chain_result 返回的是 list）。"""
+        for item in self.sent:
+            if isinstance(item, list) and item and isinstance(item[0], _Nodes):
+                return item[0].nodes
+        return []
+
+    @property
+    def texts(self) -> list[str]:
+        """发出去的普通文本消息。"""
+        return [item for item in self.sent if isinstance(item, str)]
 
 
 def _noop_decorator(*_args, **_kwargs):
@@ -170,7 +208,8 @@ def install_astrbot_stubs() -> None:
     module("astrbot")
     module("astrbot.api", logger=_make_logger())
     module("astrbot.api.event", filter=filter_mod, AstrMessageEvent=_Event)
-    module("astrbot.api.message_components", Image=_Image, Reply=_Reply, Plain=_Plain)
+    module("astrbot.api.message_components", Image=_Image, Reply=_Reply,
+           Plain=_Plain, Node=_Node, Nodes=_Nodes)
     module("astrbot.api.star", Context=object, Star=_Star, StarTools=_StarTools,
            register=lambda *a, **k: (lambda cls: cls))
     module("astrbot.core")
@@ -182,6 +221,22 @@ def install_astrbot_stubs() -> None:
 # ---------------------------------------------------------------------------
 # 2. schema / metadata 校验
 # ---------------------------------------------------------------------------
+def quiet_prepare(plugin):
+    """掐掉插件的后台浏览器安装任务，返回同一个实例。
+
+    校验用的是临时数据目录，那里当然没有浏览器，于是 ``_schedule_prepare()``
+    的后台任务会真的去执行 ``playwright install``。脚本退出时事件循环已关闭，
+    子进程的 transport 才被 GC，于是刷出一串
+    ``RuntimeError: Event loop is closed``（只在 Linux 上出现，Windows 的
+    Proactor 事件循环不报）。趁 task 还没轮到执行就取消，它不会启动子进程。
+    """
+    task = getattr(plugin, "_prepare_task", None)
+    if task is not None:
+        task.cancel()
+        plugin._prepare_task = None
+    return plugin
+
+
 def schema_defaults(schema: dict) -> dict:
     """按 AstrBot 的规则从 schema 推导默认配置字典。"""
     result = {}
@@ -286,7 +341,8 @@ def verify_plugin_entry(defaults: dict):
     print("4) 导入插件入口 main.py")
     module = plugin_module("main")
     check(hasattr(module, "ImageSearchPlugin"), "ImageSearchPlugin 已定义")
-    plugin = module.ImageSearchPlugin(context=object(), config=defaults)
+    plugin = quiet_prepare(
+        module.ImageSearchPlugin(context=object(), config=defaults))
     check(plugin.config.search.max_results == 10, "插件实例读到了配置")
     check(plugin.service.running is False, "浏览器是懒启动，构造时不拉起")
     return plugin
@@ -372,6 +428,15 @@ def verify_formatting(plugin) -> None:
     check("来源: らしんばんオンライン" in text, "默认输出站点名")
     check(text.startswith("找到以下结果"), "抬头为「找到以下结果」")
     check("尺寸:" not in text, "默认不输出尺寸")
+
+    # 字段顺序：标题 -> 来源 -> 链接，链接固定在最后一行方便复制。
+    # 抬头和第一条之间只有一个换行，所以按行取而不是按空行切块。
+    lines = text.splitlines()
+    check(lines[1].startswith("1. 标题: BUNNY A GIRL!"),
+          f"抬头之后第一行是标题：{lines[1][:26]}")
+    check(lines[2] == "来源: らしんばんオンライン", f"第二行是来源：{lines[2]}")
+    check(lines[3] == "链接: https://shop.lashinbang.com/products/detail/2273450",
+          f"第三行是链接：{lines[3][:30]}")
     print("     ---- 实际输出 ----")
     for line in text.splitlines():
         print(f"     {line}")
@@ -635,6 +700,35 @@ def verify_result_modes(defaults: dict) -> None:
         ai_page('<div data-hveid="a">' + "句子。" * 400 + '</div>'),
         max_chars=200)) <= 210, "超长描述会被截断")
 
+    # ---- 结尾的提问按标点丢弃：只看问号和位置，不猜措辞 ----
+    tail_q = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">这是正文描述。</div>'
+        '<div data-hveid="b">你想进一步了解哪方面的内容呢？</div>'))
+    check(tail_q == "这是正文描述。", f"结尾整行问句被丢弃：{tail_q!r}")
+
+    multi_q = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">正文一句。</div>'
+        '<div data-hveid="b">要看高清壁纸吗？</div>'
+        '<div data-hveid="c">Would you like more details?</div>'))
+    check(multi_q == "正文一句。", f"连续问句一并丢弃（含英文）：{multi_q!r}")
+
+    mixed_q = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">她拥有粉色长发。你想了解更多吗？</div>'))
+    check(mixed_q == "她拥有粉色长发。", f"只砍行内末尾那句：{mixed_q!r}")
+
+    # 问号不在结尾时不受影响 —— 规则只从最后一行往前扫
+    inner_q = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">这幅画的标题是《你在吗？》。</div>'
+        '<div data-hveid="b">它出自某位画师之手。</div>'))
+    check("《你在吗？》" in inner_q and "出自某位画师" in inner_q,
+          f"正文中间的问号保留：{inner_q!r}")
+
+    # 陈述句收尾的邀请语留得住，这是这条规则明确的取舍
+    kept = parser.ai_html_to_text(ai_page(
+        '<div data-hveid="a">这是正文。</div>'
+        '<div data-hveid="b">请告诉我你接下来想了解的内容。</div>'))
+    check("请告诉我" in kept, "句号收尾的邀请语不删（宁可多留，不赌措辞）")
+
     # 输出：三种组合都要正常
     match = models.ExactMatch(url="https://example.com/a", content="标题 A",
                               source="Example")
@@ -666,6 +760,195 @@ def verify_result_modes(defaults: dict) -> None:
           "两个模式都可以关掉（运行时会报错提示）")
 
 
+def _make_plugin(main_module, config):
+    """构造插件实例，并掐掉后台的浏览器安装任务（见 :func:`quiet_prepare`）。"""
+    return quiet_prepare(
+        main_module.ImageSearchPlugin(context=None, config=config))
+
+
+def _install_session_waiter_stub(picked_image) -> list:
+    """注入最小可用的 session_waiter，模拟用户补发一张图片。
+
+    返回一个列表，跑完后里面是补图那条消息对应的事件对象，用来断言
+    ``stop_event()`` 作用在它身上、而不是原来的指令事件。
+    """
+    follow_ups: list = []
+
+    class _Controller:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self, error=None) -> None:
+            self.stopped = True
+
+        def keep(self, timeout: float = 0, reset_timeout: bool = False) -> None:
+            pass
+
+    def _session_waiter(timeout: int = 30, record_history_chains: bool = False):
+        def decorator(func):
+            async def wrapper(event, session_filter=None, *args, **kwargs):
+                follow_up = _Event([picked_image])
+                follow_ups.append(follow_up)
+                await func(_Controller(), follow_up)
+                return None
+
+            return wrapper
+
+        return decorator
+
+    mod = types.ModuleType("astrbot.core.utils.session_waiter")
+    mod.session_waiter = _session_waiter
+    mod.SessionController = _Controller
+    sys.modules["astrbot.core.utils.session_waiter"] = mod
+    return follow_ups
+
+
+async def verify_message_delivery(defaults: dict) -> None:
+    """消息投递：等待补图后必须仍能发出结果，以及各种拆分/合并组合。"""
+    print("15) 消息投递（合并转发 / 拆分 / 补图后仍能回复）")
+    build_config = plugin_module("image_search.plugin_config").build_config
+    formatter = plugin_module("image_search.formatter")
+    models = plugin_module("image_search.models")
+    main_module = importlib.import_module(f"{PACKAGE_NAME}.main")
+
+    # ---- 回归：补发图片后，原指令事件不能被终止 ----
+    # AstrBot 的 pipeline 在每次 yield 之后都检查 is_stopped()，而
+    # stop_event() 会把 _force_stopped 永久置位。之前在 _wait_for_image 的
+    # finally 里对原事件调了它，导致用户只收到「正在搜索」就没有下文。
+    plugin = _make_plugin(main_module, defaults)
+    image = _Image(url="https://example.com/pic.png")
+    follow_ups = _install_session_waiter_stub(image)
+    event = _Event([_Plain("/搜图")])
+    picked = await plugin._wait_for_image(event)
+    check(picked is image, "等到了用户补发的图片")
+    check(event.stopped is False,
+          "原指令事件没有被终止（否则后续结果发不出去）")
+    check(bool(follow_ups) and follow_ups[0].stopped is True,
+          "终止的是补图那条消息，避免它再触发别的插件")
+
+    # 整条指令链路：补图之后仍然要把结果发出来
+    async def fake_search(*_args, **_kwargs):
+        return models.LensSearchResult(
+            exact_matches=[models.ExactMatch(
+                url="https://example.com/a", content="标题 A", source="Example")],
+            ai_summary="这是一张示例图片。")
+
+    plugin.service.search = fake_search
+    plugin.service.browser_ready = lambda: True
+    plugin._cooldown.clear()
+    _install_session_waiter_stub(image)
+    event = _Event([_Plain("/搜图")])
+    await plugin.search_image(event)
+    sent = [str(m) for m in event.sent]
+    check(any("请在" in s and "秒内发送" in s for s in sent), "提示了补发图片")
+    check(any(plugin.config.options.working_hint in s for s in sent),
+          "发出了搜索中提示")
+    check(bool(event.forwarded), "补图路径最终把结果发了出去（合并转发）")
+    body = "\n".join(node.text for node in event.forwarded)
+    check("这是一张示例图片。" in body and "https://example.com/a" in body,
+          "结果内容完整")
+    await plugin.terminate()
+
+    # ---- 拆分与合并的各种组合 ----
+    result = models.LensSearchResult(
+        exact_matches=[
+            models.ExactMatch(url="https://example.com/1", content="标题一",
+                              source="站点一"),
+            models.ExactMatch(url="https://example.com/2", content="标题二",
+                              source="站点二"),
+        ],
+        ai_summary="这是描述。")
+    base = build_config(defaults,
+                        data_dir=_StarTools.get_data_dir("delivery")).output
+
+    plain = formatter.format_blocks(result, base)
+    check(len(plain) == 2, f"默认：描述与结果各一块（实际 {len(plain)}）")
+    check(plain[0].startswith("【图片描述】"), "第一块是 AI 描述")
+    check("标题一" in plain[1] and "标题二" in plain[1], "结果同在第二块")
+
+    merged = formatter.format_blocks(
+        result, dataclasses.replace(base, merge_ai_and_exact=True))
+    check(len(merged) == 1, f"开启合并后只有一块（实际 {len(merged)}）")
+    check("这是描述。" in merged[0] and "标题一" in merged[0], "两类结果同块")
+
+    split = formatter.format_blocks(
+        result, dataclasses.replace(base, link_as_separate_message=True))
+    check(split[0].startswith("【图片描述】"), "拆分时描述仍独立成块")
+    check("找到以下结果" in split[1], "抬头单独成块")
+    check(split[2].startswith("1. 标题: 标题一") and "来源: 站点一" in split[2],
+          f"标题与来源同块：{split[2]!r}")
+    check(split[3] == "链接: https://example.com/1",
+          f"链接单独成块：{split[3]!r}")
+    check(split[4] == base.separator, f"结果之间插分隔块：{split[4]!r}")
+    check(split[5].startswith("2. 标题: 标题二"), "第二条紧随分隔块")
+    check(split[6] == "链接: https://example.com/2", "第二条的链接也单独成块")
+    check(len(split) == 7, f"共 7 块（实际 {len(split)}）")
+
+    # 关掉合并转发时，拆分必须失效，否则普通消息会刷屏
+    no_forward = formatter.format_blocks(result, dataclasses.replace(
+        base, link_as_separate_message=True, use_forward_message=False))
+    check(len(no_forward) == 2, f"未开合并转发时不拆分（实际 {len(no_forward)}）")
+    check(base.separator not in "".join(no_forward), "也不会插入分隔块")
+
+    # format_result 面向纯文本，强制不拆分
+    text = formatter.format_result(result, dataclasses.replace(
+        base, link_as_separate_message=True))
+    check(base.separator not in text, "format_result 里不出现分隔块")
+
+    # ---- 完全匹配没结果时要明确说出来 ----
+    # 只发 AI 描述会让人分不清「这张图没被收录」和「插件没去搜完全匹配」
+    ai_only = models.LensSearchResult(ai_summary="这是描述。")
+    only_blocks = formatter.format_blocks(ai_only, base)
+    check(len(only_blocks) == 2,
+          f"描述 + 无结果提示共两块（实际 {len(only_blocks)}）")
+    check(only_blocks[1] == base.empty_text,
+          f"第二块是无结果提示：{only_blocks[1]!r}")
+    check("这是描述。" in only_blocks[0], "AI 描述照常输出")
+
+    merged_only = formatter.format_blocks(
+        ai_only, dataclasses.replace(base, merge_ai_and_exact=True))
+    check(len(merged_only) == 1 and base.empty_text in merged_only[0],
+          "合并模式下提示与描述同块")
+
+    # 用户主动关掉完全匹配时，不该报「没找到」
+    off_blocks = formatter.format_blocks(
+        ai_only, dataclasses.replace(base, expect_exact_matches=False))
+    check(len(off_blocks) == 1 and base.empty_text not in off_blocks[0],
+          f"关掉完全匹配时不提示（实际 {off_blocks}）")
+
+    # 两者都空仍然回落到提示，不能发空消息
+    nothing = formatter.format_blocks(models.LensSearchResult(), base)
+    check(nothing == [base.empty_text], f"两者都空时只有提示：{nothing}")
+
+    # ---- 投递方式 ----
+    plugin = _make_plugin(main_module, defaults)
+    event = _Event()
+    await plugin._send_result(event, result)
+    check(len(event.forwarded) == 2, "合并转发的节点数等于块数")
+    check(event.forwarded[0].uin == "bot-self-id", "节点带上机器人自身 id")
+    check(not event.texts, "合并转发时不额外发普通消息")
+
+    plugin.config.output.use_forward_message = False
+    event = _Event()
+    await plugin._send_result(event, result)
+    check(len(event.texts) == 2, f"关闭后逐块发普通消息（实际 {len(event.texts)}）")
+    check(not event.forwarded, "不再走合并转发")
+
+    # 合并转发在别的平台会失败，必须回退而不是丢消息
+    plugin.config.output.use_forward_message = True
+    event = _Event()
+
+    async def refuse(result_):
+        if isinstance(result_, list):
+            raise RuntimeError("platform does not support forward")
+        event.sent.append(result_)
+
+    event.send = refuse
+    await plugin._send_result(event, result)
+    check(len(event.texts) == 2, "合并转发失败时回退为普通消息")
+    await plugin.terminate()
+
+
 async def verify_timeout_guard() -> None:
     """底层卡死时，用户必须收到回复，且会话要被重置。
 
@@ -675,8 +958,8 @@ async def verify_timeout_guard() -> None:
     """
     print("12) 卡死兜底与版本一致性")
     main_module = importlib.import_module(f"{PACKAGE_NAME}.main")
-    plugin = main_module.ImageSearchPlugin(
-        context=None, config={"limits": {"request_timeout_seconds": 1}})
+    plugin = quiet_prepare(main_module.ImageSearchPlugin(
+        context=None, config={"limits": {"request_timeout_seconds": 1}}))
     check(plugin.config.options.request_timeout_seconds == 1,
           "总超时配置生效（1 秒）")
 
@@ -745,6 +1028,8 @@ async def main() -> int:
     await verify_wait_fallback(plugin)
     await verify_timeout_guard()
     verify_result_modes(defaults)
+    # 放在最后：它会注入 session_waiter 桩，而第 11 节要验证「没有它」的降级
+    await verify_message_delivery(defaults)
     if args.live:
         await verify_live(plugin)
 
