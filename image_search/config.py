@@ -34,11 +34,11 @@ class SearchConfig:
             ``CHROME_PATH`` 指定。Docker 镜像里一般会落到自带的 Chromium。
         prefer_bundled_chromium: 直接优先用 Playwright 自带的 Chromium，
             不去找系统浏览器。想让行为在各环境间保持一致时可以打开。
-        auto_install_browser: 找不到浏览器时是否自动执行
-            ``playwright install --with-deps chromium``。AstrBot 装插件只会装
-            pip 依赖，不会下载浏览器，所以默认开启。
-        install_system_deps: 自动安装时是否带 ``--with-deps`` 装系统依赖库。
-            精简镜像缺 ``libnss3`` 等库，不装的话浏览器下载成功也起不来。
+        auto_install_browser: 找不到浏览器时是否自动下载 Chromium。AstrBot 装插件
+            只会装 pip 依赖，不会下载浏览器，所以默认开启。
+        install_system_deps: 自动安装时是否另行补齐系统依赖库。先下载 Chromium，
+            再运行 ``playwright install-deps``，失败时回退到可用的 apt 包清单。
+            精简镜像缺 ``libnss3`` 等库，不补的话浏览器下载成功也起不来；
             需要 root，非 root 会自动降级。
         install_timeout_seconds: 自动安装的超时秒数。要下载约 170MB 外加 apt 装库。
         browser_install_dir: 浏览器安装目录。留空则放在 ``user_data_dir`` 的
@@ -48,8 +48,8 @@ class SearchConfig:
         user_data_dir: 持久化浏览器 profile 的**父目录**。实际 profile 会按
             浏览器可执行文件分子目录（不同版本共用 profile 会起不来）。
             保留 cookie 可降低触发人机验证的概率。
-        proxy: 传给浏览器的代理地址，如 ``http://127.0.0.1:7897``。
-            为空则走系统代理 / TUN。
+        proxy: 传给浏览器和 HTTP 请求的代理地址，如
+            ``http://127.0.0.1:7897``。为空则走系统代理 / TUN。
         hl: 结果页语言。
         exact_matches: 是否抓「完全匹配」结果（收录该图的页面列表）。
         ai_mode: 是否抓「AI 模式」的图片描述。和 ``exact_matches`` 相互独立，
@@ -58,8 +58,8 @@ class SearchConfig:
             实测 ``safe=active`` 会把命中过滤的结果**清空**（不是部分过滤），
             而 Google 的默认值随出口 IP 所在地区变化，部分地区强制开启。
             显式传 ``safe=off`` 才能让行为可预期。
-        ai_wait_ms: 等 AI 回答生成完的最长时间（毫秒）。它是流式输出的，
-            打开页面时还没写完，实测 11~12 秒收敛。
+        ai_wait_ms: 等 AI 开始生成、以及生成后等待回答收敛的各阶段最长时间
+            （毫秒）。它是流式输出的，打开页面时还没写完，实测 11~12 秒收敛。
         timeout_ms: 单步操作超时（毫秒）。
         settle_ms: 结果页渲染后额外等待时间（毫秒），等异步块加载完。
         warmup: 浏览器启动后是否先访问一次 Google 首页拿 cookie。

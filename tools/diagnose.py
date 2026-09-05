@@ -1,8 +1,8 @@
 """分段体检：逐步验证反搜链路的每一环，快速定位卡在哪一步。
 
-    python tools/diagnose.py
-    python tools/diagnose.py --proxy http://127.0.0.1:7897
-    python tools/diagnose.py --headed --playwright-launch   # 对比自动化标记的影响
+    python tools/diagnose.py --image /path/to/image.png
+    python tools/diagnose.py --image /path/to/image.png --proxy http://127.0.0.1:7897
+    python tools/diagnose.py --image /path/to/image.png --headed --playwright-launch
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from image_search import LensSession, SearchConfig  # noqa: E402
 from image_search.browser import BrowserSession  # noqa: E402
 from image_search.exceptions import RateLimitedError  # noqa: E402
 from image_search.loader import load_image  # noqa: E402
+from image_search.logger import exception_for_log  # noqa: E402
 from image_search.parser import EXTRACT_SCRIPT, extract_items  # noqa: E402
 from image_search.uploader import to_exact_matches_url  # noqa: E402
 
@@ -28,7 +29,7 @@ EXPIRED_HINT = "Expired visual search"
 
 async def main() -> int:  # noqa: PLR0911, PLR0915
     ap = argparse.ArgumentParser()
-    ap.add_argument("--image", default=str(ROOT / "test_imgs" / "test.png"))
+    ap.add_argument("--image", required=True)
     ap.add_argument("--proxy", default=None)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--playwright-launch", action="store_true",
@@ -46,17 +47,17 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
     )
     print(f"启动方式: {'CDP 附加（普通启动浏览器）' if config.use_cdp else 'Playwright launch'}")
 
-    # 1. 出口 IP
-    print("\n1) 出口 IP")
+    # 1. 出口连通性。不要打印真实 IP 或网络身份信息。
+    print("\n1) 出口连通性")
     try:
         import httpx
 
         async with httpx.AsyncClient(timeout=20, proxy=args.proxy) as client:
-            info = (await client.get("https://ipinfo.io/json")).json()
-        print(f"   {OK} {info.get('ip')}  {info.get('city')}/{info.get('country')}  "
-              f"{info.get('org')}")
+            response = await client.get("https://www.google.com/generate_204")
+            response.raise_for_status()
+        print(f"   {OK} Google 可达（网络身份已隐藏）")
     except Exception as exc:  # noqa: BLE001
-        print(f"   {BAD} {type(exc).__name__}: {exc}")
+        print(f"   {BAD} {exception_for_log(exc)}")
 
     # 2. 图片加载
     print("2) 读取图片")
@@ -64,7 +65,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
         data, name, mime = await load_image(args.image, config)
         print(f"   {OK} {name}  {len(data)} bytes  {mime}")
     except Exception as exc:  # noqa: BLE001
-        print(f"   {BAD} {type(exc).__name__}: {exc}")
+        print(f"   {BAD} {exception_for_log(exc)}")
         return 1
 
     # 3/4. 纯 HTTP 上传 + OCR（同一会话）
@@ -74,7 +75,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
             location = await http_session.upload(data, name, mime)
             print(f"   {OK} 拿到结果页地址（{len(location)} 字符）")
         except Exception as exc:  # noqa: BLE001
-            print(f"   {BAD} {type(exc).__name__}: {exc}")
+            print(f"   {BAD} {exception_for_log(exc)}")
             return 1
 
         print("4) qfmetadata OCR（必须复用上传的会话）")
@@ -85,7 +86,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
             else:
                 print(f"   {WARN} 返回空 —— 图里可能没文字")
         except Exception as exc:  # noqa: BLE001
-            print(f"   {BAD} {type(exc).__name__}: {exc}")
+            print(f"   {BAD} {exception_for_log(exc)}")
 
     # 5. 启动浏览器
     print("5) 启动浏览器")
@@ -99,7 +100,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
         if "HeadlessChrome" in user_agent:
             print(f"   {WARN} UA 里还有 HeadlessChrome，会被 Google 拦下")
     except Exception as exc:  # noqa: BLE001
-        print(f"   {BAD} {type(exc).__name__}: {exc}")
+        print(f"   {BAD} {exception_for_log(exc)}")
         return 1
 
     try:
@@ -110,7 +111,7 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
             location = await browser_session.upload(data, name, mime)
             print(f"   {OK} 拿到结果页地址")
         except Exception as exc:  # noqa: BLE001
-            print(f"   {BAD} {type(exc).__name__}: {exc}")
+            print(f"   {BAD} {exception_for_log(exc)}")
             return 1
 
         # 7. 渲染并抽卡片
@@ -120,10 +121,10 @@ async def main() -> int:  # noqa: PLR0911, PLR0915
             payload = await browser.render_and_extract(exact_url, EXTRACT_SCRIPT,
                                                       debug_name="diagnose")
         except RateLimitedError as exc:
-            print(f"   {BAD} 人机验证: {exc}")
+            print(f"   {BAD} 人机验证: {exception_for_log(exc)}")
             return 3
         except Exception as exc:  # noqa: BLE001
-            print(f"   {BAD} {type(exc).__name__}: {exc}")
+            print(f"   {BAD} {exception_for_log(exc)}")
             return 1
 
         items = extract_items(payload, config.max_results)

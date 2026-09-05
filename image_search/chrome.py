@@ -94,16 +94,20 @@ def profile_for(base: pathlib.Path, executable: str) -> pathlib.Path:
 
 def locate_chrome(explicit: str | None = None, bundled: str | None = None,
                   install_dir: pathlib.Path | str | None = None,
+                  *, allow_unmanaged_install: bool = False,
                   ) -> tuple[str | None, list[str]]:
     """按顺序找浏览器，返回 ``(路径或 None, 每一步的检查记录)``。
 
     检查记录用来拼诊断信息 —— 只说「找不到浏览器」没法定位问题，
     得说清楚查了哪些位置、各自是什么情况。
 
-    查找顺序：显式指定 → ``CHROME_PATH`` → 插件自己装的 Chromium →
+    查找顺序：显式指定 → ``CHROME_PATH`` → 插件目录中的 Chromium →
     系统安装的 Chrome/Chromium/Edge → Playwright 默认位置的 Chromium。
+
+    自动安装模式只接受带插件完成标记的浏览器；管理员关闭自动安装并接管该目录时，
+    ``allow_unmanaged_install`` 允许使用只有 Playwright 完成标记的当前 revision。
     """
-    from .installer import find_chromium_in
+    from .installer import find_current_chromium_in, find_managed_chromium_in
 
     checked: list[str] = []
 
@@ -121,7 +125,9 @@ def locate_chrome(explicit: str | None = None, bundled: str | None = None,
         checked.append("环境变量 CHROME_PATH: 未设置")
 
     if install_dir:
-        local = find_chromium_in(install_dir)
+        local = find_managed_chromium_in(install_dir)
+        if local is None and allow_unmanaged_install:
+            local = find_current_chromium_in(install_dir)
         if local:
             return local, checked
         checked.append(f"插件自装目录里没有 Chromium: {install_dir}")
@@ -166,7 +172,7 @@ def browser_missing_message(checked: list[str],
     lines.append("")
     if auto_install_enabled:
         lines.append("插件已开启自动安装，会在后台下载；等几分钟后重试即可。")
-        lines.append("若一直失败，可手动执行下面的命令。")
+        lines.append("若一直失败，可先关闭「自动安装浏览器」，再执行下面的命令。")
     lines.append("手动安装（在 AstrBot 容器内执行）：")
     target = str(install_dir) if install_dir else "<插件数据目录>/ms-playwright"
     lines.append(f"  PLAYWRIGHT_BROWSERS_PATH={target} \\")
@@ -188,9 +194,13 @@ def browser_missing_message(checked: list[str],
 
 
 def find_chrome(explicit: str | None = None, bundled: str | None = None,
-                install_dir: pathlib.Path | str | None = None) -> str:
+                install_dir: pathlib.Path | str | None = None, *,
+                allow_unmanaged_install: bool = False) -> str:
     """找一个可用的 Chromium 内核浏览器，找不到就抛带诊断信息的异常。"""
-    path, checked = locate_chrome(explicit, bundled, install_dir)
+    path, checked = locate_chrome(
+        explicit, bundled, install_dir,
+        allow_unmanaged_install=allow_unmanaged_install,
+    )
     if path:
         return path
     if explicit and any("chrome_path" in item for item in checked):
@@ -347,6 +357,15 @@ class ChromeProcess:
         """浏览器自报的 UA（来自 CDP /json/version）。"""
         return self.version_info.get("User-Agent", "")
 
+    @property
+    def browser_version(self) -> str | None:
+        """浏览器自报的四段版本号。"""
+        return version_number(self.version_info.get("Browser", ""))
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
     def build_args(self) -> list[str]:
         args = [
             self.executable,
@@ -383,20 +402,24 @@ class ChromeProcess:
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
         # 上一轮没退干净的话，profile 里会留下单例锁和孤儿进程，直接启动会失败
         release_profile(self.user_data_dir, self.executable)
-        self._spawn()
-        try:
-            self.version_info = self._wait_ready(timeout)
-        except BrowserNotAvailableError:
-            # 退出码 21 = ProcessSingleton 建不起来。再清一次并重试，
-            # 覆盖「清理后又有进程抢先占上」这种竞态。
-            code = self.process.returncode if self.process else None
-            self.process = None
-            if code != 21:
-                raise
-            logger.warning("profile 被占用（退出码 21），清理后重试一次")
-            release_profile(self.user_data_dir, self.executable)
+        for attempt in range(2):
             self._spawn()
-            self.version_info = self._wait_ready(timeout)
+            try:
+                self.version_info = self._wait_ready(timeout)
+                return
+            except BrowserNotAvailableError:
+                # 退出码 21 = ProcessSingleton 建不起来。清理完整进程树后
+                # 只重试一次，覆盖「清理后又有进程抢先占上」这种竞态。
+                code = self.process.returncode if self.process else None
+                self.stop()
+                if code != 21 or attempt:
+                    raise
+                logger.warning("profile 被占用（退出码 21），清理后重试一次")
+                release_profile(self.user_data_dir, self.executable)
+            except BaseException:
+                self.stop()
+                raise
+        raise BrowserNotAvailableError("浏览器启动失败")
 
     def _spawn(self) -> None:
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -435,27 +458,68 @@ class ChromeProcess:
             return
         process, self.process = self.process, None
         pid = process.pid
-        with contextlib.suppress(Exception):
-            process.terminate()
+        if os.name == "nt":
+            with contextlib.suppress(Exception):
+                subprocess.run(  # noqa: S603
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=5)
         except Exception:  # noqa: BLE001
+            if os.name != "nt":
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
             with contextlib.suppress(Exception):
                 process.kill()
             with contextlib.suppress(Exception):
                 process.wait(timeout=5)
-        # Chrome 会拉起一堆子进程，父进程退出不代表它们也退了
-        if os.name != "nt":
-            with contextlib.suppress(Exception):
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-        remaining = browsers_using_profile(self.user_data_dir)
-        if remaining:
-            logger.debug("仍有 %d 个残留进程占着 profile，强制清理", len(remaining))
-            release_profile(self.user_data_dir, self.executable)
+        self.version_info = {}
+
+
+_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+\.\d+)\b")
+
+
+def version_number(text: str) -> str | None:
+    match = _VERSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def executable_version(executable: str) -> str | None:
+    """读取浏览器二进制版本，用于避免复用升级前缓存的 UA。"""
+    # Windows 版 chrome.exe 的 --version 行为不稳定，部分渠道会直接拉起 GUI。
+    # 那里改用文件指纹确认二进制未被替换，版本仍以首次 CDP 自报值为准。
+    if os.name == "nt":
+        return None
+    creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [executable, "--version"], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=10, check=False,
+            creationflags=creation)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return version_number(completed.stdout or "")
+
+
+def executable_fingerprint(executable: str) -> dict[str, int] | None:
+    try:
+        stat = pathlib.Path(executable).stat()
+    except OSError:
+        return None
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+    }
 
 
 def read_cached_user_agent(user_data_dir: pathlib.Path,
-                          executable: str) -> str | None:
+                           executable: str) -> str | None:
     """读之前探测到的 UA，避免每次启动都要重启一遍。"""
     path = user_data_dir / UA_CACHE_NAME
     if not path.is_file():
@@ -466,25 +530,47 @@ def read_cached_user_agent(user_data_dir: pathlib.Path,
         return None
     if data.get("executable") != executable:
         return None
+    cached_version = data.get("browser_version")
+    cached_fingerprint = data.get("executable_fingerprint")
+    current_fingerprint = executable_fingerprint(executable)
+    if (not isinstance(cached_fingerprint, dict)
+            or not current_fingerprint
+            or cached_fingerprint != current_fingerprint):
+        logger.debug("浏览器二进制已变化，丢弃 UA 缓存")
+        return None
+    current_version = executable_version(executable)
+    if (not isinstance(cached_version, str)
+            or (current_version and cached_version != current_version)):
+        logger.debug("浏览器版本已变化，丢弃 UA 缓存")
+        return None
     user_agent = data.get("user_agent")
     return user_agent if isinstance(user_agent, str) and user_agent else None
 
 
 def write_cached_user_agent(user_data_dir: pathlib.Path, executable: str,
-                            user_agent: str) -> None:
+                            user_agent: str,
+                            browser_version: str | None = None) -> None:
     path = user_data_dir / UA_CACHE_NAME
+    detected_version = browser_version or executable_version(executable)
+    fingerprint = executable_fingerprint(executable)
+    if not detected_version or not fingerprint:
+        logger.debug("无法确认浏览器版本或二进制指纹，不写入 UA 缓存")
+        return
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         user_data_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"executable": executable,
-                                    "user_agent": user_agent}),
-                        encoding="utf-8")
+        temporary.write_text(json.dumps({
+            "executable": executable,
+            "browser_version": detected_version,
+            "executable_fingerprint": fingerprint,
+            "user_agent": user_agent,
+        }), encoding="utf-8")
+        os.replace(temporary, path)
     except OSError:
-        pass
-
-
-_VERSION_RE = re.compile(r"\b(\d+)\.\d+\.\d+\.\d+\b")
+        with contextlib.suppress(OSError):
+            temporary.unlink()
 
 
 def major_version(user_agent: str) -> int | None:
-    match = _VERSION_RE.search(user_agent)
-    return int(match.group(1)) if match else None
+    version = version_number(user_agent)
+    return int(version.split(".", 1)[0]) if version else None

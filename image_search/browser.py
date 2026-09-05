@@ -13,9 +13,11 @@ Playwright launch 必被拦，而普通启动 Chrome + CDP 附加可以正常拿
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import pathlib
 import time
+import urllib.parse as up
 from typing import Any
 
 from .chrome import (
@@ -32,6 +34,7 @@ from .config import SOCS_COOKIE, SearchConfig
 from .exceptions import (
     BrowserNotAvailableError,
     FetchError,
+    ParseError,
     RateLimitedError,
     UploadError,
 )
@@ -39,8 +42,16 @@ from .installer import (
     BrowserInstaller,
     InstallState,
     default_browsers_dir,
+    find_default_chromium,
 )
-from .logger import logger, quiet_http_logs
+from .logger import (
+    exception_for_log,
+    logger,
+    path_for_log,
+    quiet_http_logs,
+    url_for_log,
+)
+from .parser import candidate_limit
 from .uploader import to_ai_mode_url, to_exact_matches_url
 
 
@@ -57,6 +68,8 @@ class LensPageResult:
     exact_payload: Any = None
     ai_url: str = ""
     ai_payload: Any = None
+    exact_error: Exception | None = None
+    ai_error: Exception | None = None
 
 _CAPTCHA_HINT = (
     "Google 弹出了人机验证（/sorry/index）。\n"
@@ -70,8 +83,6 @@ _CAPTCHA_HINT = (
     "  4. 换出口 IP / 代理节点，机房 IP 的失败率明显更高；\n"
     "  5. 用 headless=False 手动过一次验证，豁免 cookie 会存进 profile。"
 )
-
-
 def playwright_version_mismatch() -> tuple[str, str] | None:
     """检查「进程里已加载的 playwright 客户端」和「磁盘上的版本」是否一致。
 
@@ -130,6 +141,8 @@ class BrowserSession:
         self._chrome: ChromeProcess | None = None
         self._installer: BrowserInstaller | None = None
         self._lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._startup_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def context(self) -> Any:
@@ -152,8 +165,12 @@ class BrowserSession:
     # -- 启动 / 关闭 --------------------------------------------------------
     async def start(self) -> None:
         async with self._lock:
-            if self._context is not None:
+            await self._wait_for_cleanup()
+            if await self._is_healthy():
                 return
+            if any((self._playwright, self._browser, self._context, self._chrome)):
+                logger.warning("浏览器会话已失效，清理后重新启动")
+                await asyncio.shield(self._begin_cleanup())
             try:
                 from playwright.async_api import async_playwright
             except ImportError as exc:  # pragma: no cover
@@ -167,16 +184,126 @@ class BrowserSession:
                 raise BrowserNotAvailableError(
                     _VERSION_MISMATCH_HINT.format(loaded=loaded, on_disk=on_disk))
 
-            self._playwright = await async_playwright().start()
             try:
+                await self._start_playwright(async_playwright)
                 if self._config.use_cdp:
                     await self._start_cdp()
                 else:
                     await self._start_playwright_launch()
-            except Exception:
-                await self._teardown()
+                await self._prepare_context()
+            except asyncio.CancelledError:
+                self._begin_cleanup()
                 raise
-            await self._prepare_context()
+            except Exception:
+                await asyncio.shield(self._begin_cleanup())
+                raise
+
+    async def _start_playwright(self, factory: Any) -> None:
+        """让 Playwright driver 的启动在取消时也能被取得并关闭。"""
+        start_task = asyncio.create_task(factory().start())
+        try:
+            self._playwright = await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._finish_cancelled_playwright_start(start_task))
+            self._track_startup_cleanup(cleanup, "Playwright 启动")
+            raise
+
+    async def _is_healthy(self) -> bool:
+        """同时检查 Python 连接状态和底层 Chrome 进程是否仍然存活。"""
+        if self._context is None:
+            return False
+        if self._chrome is not None and not self._chrome.running:
+            return False
+        if self._browser is not None:
+            try:
+                if not self._browser.is_connected():
+                    return False
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            probe = self._context.cookies(["https://www.google.com"])
+            await asyncio.wait_for(probe, timeout=3)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def _begin_cleanup(self) -> asyncio.Task[None]:
+        """复用正在运行的清理任务，并持有它直到真正结束。"""
+        cleanup = self._cleanup_task
+        if cleanup is not None and not cleanup.done():
+            return cleanup
+        cleanup = asyncio.create_task(self._teardown())
+        self._cleanup_task = cleanup
+        cleanup.add_done_callback(self._cleanup_finished)
+        return cleanup
+
+    def _cleanup_finished(self, cleanup: asyncio.Task[None]) -> None:
+        if self._cleanup_task is cleanup:
+            self._cleanup_task = None
+        if cleanup.cancelled():
+            return
+        error = cleanup.exception()
+        if error is not None:
+            logger.debug("浏览器后台清理失败: %s", exception_for_log(error))
+
+    async def _wait_for_cleanup(self) -> None:
+        while True:
+            tasks = [
+                task for task in self._startup_cleanup_tasks
+                if not task.done()
+            ]
+            cleanup = self._cleanup_task
+            if cleanup is not None and not cleanup.done():
+                tasks.append(cleanup)
+            if not tasks:
+                return
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+
+    def _track_startup_cleanup(self, task: asyncio.Task[None], label: str) -> None:
+        """强引用不可取消的启动收尾，并统一取走异常。"""
+        self._startup_cleanup_tasks.add(task)
+        task.add_done_callback(
+            lambda done: self._startup_cleanup_finished(done, label))
+
+    def _startup_cleanup_finished(
+        self,
+        task: asyncio.Task[None],
+        label: str,
+    ) -> None:
+        self._startup_cleanup_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("%s取消后的资源回收失败: %s",
+                           label, exception_for_log(error))
+
+    @staticmethod
+    async def _finish_cancelled_playwright_start(
+        start_task: asyncio.Task[Any],
+    ) -> None:
+        """取得迟到创建的 Playwright 实例并立即停止它。"""
+        try:
+            playwright = await start_task
+        except Exception:
+            return
+        await playwright.stop()
+
+    @staticmethod
+    async def _finish_chrome_start(
+        start_task: asyncio.Task[None],
+        chrome: ChromeProcess,
+    ) -> None:
+        """等待不可取消的线程启动结束，再回收它可能创建的进程。"""
+        try:
+            await start_task
+        except Exception:
+            pass
+        await asyncio.to_thread(chrome.stop)
 
     async def _start_cdp(self) -> None:
         """普通方式启动浏览器，再通过 CDP 附加。默认路径。"""
@@ -184,7 +311,8 @@ class BrowserSession:
         executable = await self._resolve_executable()
         # profile 按浏览器隔离：不同版本的浏览器共用 profile 会起不来
         profile = profile_for(cfg.resolved_user_data_dir(), executable)
-        logger.debug("使用浏览器: %s (profile=%s)", executable, profile)
+        logger.debug("使用浏览器 %s（profile=%s）",
+                     path_for_log(executable), path_for_log(profile))
 
         self._chrome = await self._launch_chrome(
             executable, profile, read_cached_user_agent(profile, executable))
@@ -195,8 +323,10 @@ class BrowserSession:
             fixed = normalize_user_agent(self._chrome.browser_user_agent)
             if fixed:
                 logger.debug("UA 含 HeadlessChrome，改写后重启: %s", fixed)
+                browser_version = self._chrome.browser_version
                 await asyncio.to_thread(self._chrome.stop)
-                write_cached_user_agent(profile, executable, fixed)
+                write_cached_user_agent(
+                    profile, executable, fixed, browser_version)
                 self._chrome = await self._launch_chrome(executable, profile, fixed)
 
         self._browser = await self._playwright.chromium.connect_over_cdp(
@@ -217,15 +347,33 @@ class BrowserSession:
             user_agent=user_agent,
             no_sandbox=cfg.no_sandbox,
         )
-        await asyncio.to_thread(chrome.start)
+        start_task = asyncio.create_task(asyncio.to_thread(chrome.start))
+        try:
+            await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            # to_thread 本身无法被取消；等 start() 到达终态后再收进程，
+            # 否则可能在 stop() 返回之后才姗姗来迟地 spawn 出孤儿 Chrome。
+            cleanup = asyncio.create_task(
+                self._finish_chrome_start(start_task, chrome))
+            self._track_startup_cleanup(cleanup, "Chrome 启动")
+            raise
+        except Exception:
+            cleanup = asyncio.create_task(
+                self._finish_chrome_start(start_task, chrome))
+            self._track_startup_cleanup(cleanup, "Chrome 启动")
+            await asyncio.shield(cleanup)
+            raise
         return chrome
 
     def _bundled_chromium(self) -> str | None:
         """Playwright 默认位置的 Chromium 路径（可能并不存在）。"""
         try:
-            return self._playwright.chromium.executable_path
+            path = self._playwright.chromium.executable_path
+            if pathlib.Path(path).is_file():
+                return path
         except Exception:  # noqa: BLE001
-            return None
+            pass
+        return find_default_chromium()
 
     async def _resolve_executable(self) -> str:
         """定位浏览器；缺失且开了自动安装就先装再找。"""
@@ -236,7 +384,12 @@ class BrowserSession:
             explicit = bundled
         install_dir = self.browsers_dir
 
-        path, checked = locate_chrome(explicit, bundled, install_dir)
+        path, checked = locate_chrome(
+            explicit,
+            bundled,
+            install_dir,
+            allow_unmanaged_install=not cfg.auto_install_browser,
+        )
         if path:
             return path
 
@@ -274,7 +427,15 @@ class BrowserSession:
 
     def browser_ready(self) -> bool:
         """当前是否已经有可用的浏览器（不启动 Playwright，纯文件检查）。"""
-        path, _ = locate_chrome(self._config.chrome_path, None, self.browsers_dir)
+        bundled = find_default_chromium()
+        explicit = (bundled if self._config.prefer_bundled_chromium and bundled
+                    else self._config.chrome_path)
+        path, _ = locate_chrome(
+            explicit,
+            bundled,
+            self.browsers_dir,
+            allow_unmanaged_install=not self._config.auto_install_browser,
+        )
         return path is not None
 
     async def ensure_browser_installed(self) -> str | None:
@@ -330,7 +491,7 @@ class BrowserSession:
         try:
             await self._context.clear_cookies()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("清 cookie 失败: %s", exc)
+            logger.debug("清 cookie 失败: %s", exception_for_log(exc))
             return
         await self._prepare_context()
 
@@ -354,37 +515,42 @@ class BrowserSession:
             if "/sorry/" in page.url:
                 logger.debug("预热时就撞上了人机验证，出口 IP 可能信誉不佳")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("预热失败，忽略: %s", exc)
+            logger.debug("预热失败，忽略: %s", exception_for_log(exc))
         finally:
             await page.close()
 
     async def close(self) -> None:
         async with self._lock:
-            await self._teardown()
+            await self._wait_for_cleanup()
+            await asyncio.shield(self._begin_cleanup())
 
     async def _teardown(self) -> None:
-        if self._context is not None and self._browser is None:
+        context, self._context = self._context, None
+        browser, self._browser = self._browser, None
+        playwright, self._playwright = self._playwright, None
+        chrome, self._chrome = self._chrome, None
+
+        if chrome is not None:
+            try:
+                await asyncio.to_thread(chrome.stop)
+            except Exception:  # noqa: BLE001
+                pass
+        if context is not None and browser is None:
             # launch_persistent_context 拿到的是 context，关它即可
             try:
-                await self._context.close()
+                await context.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._context = None
-        if self._browser is not None:
+        if browser is not None:
             try:
-                await self._browser.close()
+                await browser.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._browser = None
-        if self._playwright is not None:
+        if playwright is not None:
             try:
-                await self._playwright.stop()
+                await playwright.stop()
             except Exception:  # noqa: BLE001
                 pass
-            self._playwright = None
-        if self._chrome is not None:
-            await asyncio.to_thread(self._chrome.stop)
-            self._chrome = None
 
     async def __aenter__(self) -> BrowserSession:
         await self.start()
@@ -445,38 +611,46 @@ class BrowserSession:
                                 timeout=cfg.timeout_ms)
             except Exception as exc:  # noqa: BLE001
                 raise FetchError(
-                    f"打开 Lens 上传页失败: {type(exc).__name__}: {exc}") from exc
+                    f"打开 Lens 上传页失败: {type(exc).__name__}") from exc
             self._assert_not_blocked(page.url)
             await page.wait_for_timeout(2000)
             await self._dismiss_consent(page)
 
             lens_url = await self._submit_image(page, image, filename, mime)
-            logger.debug("上传后的结果页: %s", lens_url)
+            logger.debug("已取得上传结果页 %s", url_for_log(lens_url))
             outcome = LensPageResult(lens_url=lens_url)
 
             if exact_script is not None:
                 outcome.exact_url = to_exact_matches_url(
                     lens_url, cfg.hl, cfg.safe_search)
-                logger.debug("完全匹配页: %s", outcome.exact_url)
+                logger.debug("准备采集完全匹配页")
                 try:
-                    await page.goto(outcome.exact_url,
-                                    wait_until="domcontentloaded",
-                                    timeout=cfg.timeout_ms)
-                except Exception as exc:  # noqa: BLE001
-                    raise FetchError(
-                        f"打开完全匹配页失败: {type(exc).__name__}: {exc}") from exc
-                self._assert_not_blocked(page.url)
-                await self._settle(page)
-                outcome.exact_payload = await page.evaluate(exact_script)
-                if cfg.debug_dir and debug_name:
-                    await self._dump(page, debug_name)
+                    outcome.exact_payload = await self._collect_exact(
+                        page, outcome.exact_url, exact_script, debug_name)
+                except RateLimitedError:
+                    raise
+                except (FetchError, ParseError) as exc:
+                    if ai_script is None:
+                        raise
+                    outcome.exact_error = exc
+                    logger.warning("完全匹配抓取失败，继续尝试 AI 模式: %s",
+                                   exception_for_log(exc))
 
             if ai_script is not None:
                 outcome.ai_url = to_ai_mode_url(lens_url, cfg.hl,
                                                 cfg.safe_search)
-                logger.debug("AI 模式页: %s", outcome.ai_url)
-                outcome.ai_payload = await self._collect_ai(
-                    page, outcome.ai_url, ai_script, debug_name)
+                logger.debug("准备采集 AI 模式页")
+                try:
+                    outcome.ai_payload = await self._collect_ai(
+                        page, outcome.ai_url, ai_script, debug_name)
+                except RateLimitedError:
+                    raise
+                except (FetchError, ParseError) as exc:
+                    if exact_script is None:
+                        raise
+                    outcome.ai_error = exc
+                    logger.warning("AI 模式抓取失败，保留完全匹配结果: %s",
+                                   exception_for_log(exc))
             return outcome
         finally:
             if opened:
@@ -487,9 +661,27 @@ class BrowserSession:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def _collect_exact(self, page: Any, url: str, script: str,
+                             debug_name: str | None) -> dict[str, Any]:
+        """打开完全匹配页，按候选数量稳定条件完成采集。"""
+        try:
+            await page.goto(url, wait_until="domcontentloaded",
+                            timeout=self._config.timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            raise FetchError(
+                f"打开完全匹配页失败: {type(exc).__name__}") from exc
+        self._assert_not_blocked(page.url)
+        payload = await self._settle(page, script)
+        if (not isinstance(payload, dict)
+                or not isinstance(payload.get("items"), list)):
+            raise ParseError("完全匹配页面脚本返回了无效数据，页面结构可能已变化")
+        if self._config.debug_dir and debug_name:
+            await self._dump(page, debug_name)
+        return payload
+
     async def _collect_ai(self, page: Any, url: str, script: str,
-                          debug_name: str | None) -> Any:
-        """打开 AI 模式页，等回答写完再抽取。抓不到就返回 None，不影响主流程。
+                          debug_name: str | None) -> dict[str, Any]:
+        """打开 AI 模式页，先等正文出现，再单独计算回答收敛时间。
 
         AI 的回答是流式输出的，打开页面时才刚开始写。这里等到「已经开始生成」
         且「字数连续几轮不再增长」为止，实测 11~12 秒收敛。
@@ -499,22 +691,40 @@ class BrowserSession:
             await page.goto(url, wait_until="domcontentloaded",
                             timeout=cfg.timeout_ms)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("打开 AI 模式页失败，跳过: %s", exc)
-            return None
+            raise FetchError(
+                f"打开 AI 模式页失败: {type(exc).__name__}") from exc
         self._assert_not_blocked(page.url)
 
-        deadline = time.monotonic() + cfg.ai_wait_ms / 1000
-        payload: Any = None
-        last, stable = -1, 0
-        while time.monotonic() < deadline:
-            await page.wait_for_timeout(1200)
+        wait_seconds = max(0.1, cfg.ai_wait_ms / 1000)
+        start_deadline = time.monotonic() + wait_seconds
+        convergence_deadline: float | None = None
+        payload: dict[str, Any] | None = None
+        last, stable, evaluate_failures = -1, 0, 0
+        while True:
+            deadline = convergence_deadline or start_deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await page.wait_for_timeout(min(1200, max(100, int(remaining * 1000))))
             try:
-                payload = await page.evaluate(script)
+                current = await page.evaluate(script)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("AI 模式提取脚本执行失败: %s", exc)
-                return None
-            count = int(payload.get("charCount") or 0)
-            if not payload.get("started") and count == 0:
+                evaluate_failures += 1
+                if evaluate_failures < 3:
+                    logger.debug("AI 模式提取脚本暂时失败: %s",
+                                 type(exc).__name__)
+                    continue
+                raise ParseError(
+                    f"AI 模式提取脚本连续失败: {type(exc).__name__}") from exc
+            payload = self._validate_ai_payload(current)
+            evaluate_failures = 0
+            count = payload["charCount"]
+            if not payload["started"] or count <= 0:
+                continue
+            if convergence_deadline is None:
+                # 生成前的排队时间不应蚕食正文生成时间。
+                convergence_deadline = time.monotonic() + wait_seconds
+                last, stable = count, 0
                 continue
             if count == last:
                 stable += 1
@@ -522,11 +732,30 @@ class BrowserSession:
                     break
             else:
                 stable, last = 0, count
-        else:
+        if (payload is None or not payload["started"]
+                or payload["charCount"] <= 0):
+            raise ParseError(
+                f"AI 模式在 {cfg.ai_wait_ms} ms 内没有生成可用正文")
+        if convergence_deadline and time.monotonic() >= convergence_deadline:
             logger.debug("AI 回答在 %d ms 内没有收敛，用当前内容",
                          cfg.ai_wait_ms)
         if cfg.debug_dir and debug_name:
             await self._dump(page, f"{debug_name}_ai")
+        return payload
+
+    @staticmethod
+    def _validate_ai_payload(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ParseError(
+                f"AI 页面脚本返回了意外类型: {type(payload).__name__}")
+        started = payload.get("started")
+        html = payload.get("html")
+        count = payload.get("charCount")
+        if (type(started) is not bool or not isinstance(html, str)
+                or type(count) is not int or count < 0):
+            raise ParseError("AI 页面脚本返回的数据结构无效，页面结构可能已变化")
+        if count > 0 and not html.strip():
+            raise ParseError("AI 页面报告已有正文，但没有返回正文 HTML")
         return payload
 
     async def _submit_image(self, page: Any, image: bytes, filename: str,
@@ -552,7 +781,8 @@ class BrowserSession:
             try:
                 await element.set_input_files(payload)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("file input[%d] 不接受文件: %s", index, exc)
+                logger.debug("file input[%d] 不接受文件: %s", index,
+                             exception_for_log(exc))
                 continue
             navigated = False
             for _ in range(12):
@@ -565,28 +795,64 @@ class BrowserSession:
                 logger.debug("file input[%d] 塞进去了但没跳转", index)
                 continue
 
-            # 等参数补全
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:  # noqa: BLE001
-                pass
-            await page.wait_for_timeout(4000)
-            self._assert_not_blocked(page.url)
+            # Google 会逐步补齐结果页查询参数。按 URL 连续稳定来判断完成，
+            # 避免无论快慢都固定再睡四秒。
+            deadline = time.monotonic() + min(
+                12.0, max(3.0, self._config.timeout_ms / 1000))
+            last_url, stable = page.url, 0
+            while time.monotonic() < deadline:
+                await page.wait_for_timeout(600)
+                self._assert_not_blocked(page.url)
+                if page.url == last_url:
+                    stable += 1
+                    if stable >= 3:
+                        break
+                else:
+                    last_url, stable = page.url, 0
             return page.url
         raise UploadError(
             "上传后没有跳转到结果页。可能是图片被拒绝，或 Lens 页面结构变了")
 
-    async def _settle(self, page: Any) -> None:
-        """等结果渲染完：等网络空闲、再滚几屏把懒加载的卡片带出来。"""
+    async def _settle(self, page: Any, script: str) -> Any:
+        """等候选数量稳定或达到超采样目标，并按需触发有限次懒加载。"""
         try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
+            await page.wait_for_load_state(
+                "networkidle", timeout=min(10_000, self._config.timeout_ms))
         except Exception:  # noqa: BLE001
             pass
-        await page.wait_for_timeout(self._config.settle_ms)
-        for _ in range(3):
-            await page.mouse.wheel(0, 2200)
-            await page.wait_for_timeout(900)
-        self._assert_not_blocked(page.url)
+        deadline = time.monotonic() + max(2.0, self._config.settle_ms / 1000)
+        target = candidate_limit(self._config.max_results)
+        payload: Any = None
+        last_count, stable, scrolls = -1, 0, 0
+
+        while True:
+            self._assert_not_blocked(page.url)
+            try:
+                payload = await page.evaluate(script)
+            except Exception as exc:  # noqa: BLE001
+                raise ParseError(
+                    f"结果页提取脚本执行失败: {type(exc).__name__}") from exc
+            if not isinstance(payload, dict) or not isinstance(
+                    payload.get("items"), list):
+                return payload
+
+            count = len(payload["items"])
+            if target == 0 or count >= target:
+                return payload
+            if count == last_count:
+                stable += 1
+                if count > 0 and stable >= 2:
+                    return payload
+            else:
+                last_count, stable = count, 0
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return payload
+            if scrolls < 5:
+                await page.mouse.wheel(0, 2200)
+                scrolls += 1
+            await page.wait_for_timeout(min(700, max(100, int(remaining * 1000))))
 
     async def render_and_extract(self, url: str, script: str,
                                  debug_name: str | None = None) -> Any:
@@ -606,21 +872,10 @@ class BrowserSession:
                 await page.goto(url, wait_until="domcontentloaded",
                                 timeout=cfg.timeout_ms)
             except Exception as exc:  # noqa: BLE001
-                raise FetchError(f"打开结果页失败: {type(exc).__name__}: {exc}") from exc
+                raise FetchError(f"打开结果页失败: {type(exc).__name__}") from exc
 
             self._assert_not_blocked(page.url)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20_000)
-            except Exception:  # noqa: BLE001
-                pass
-            await page.wait_for_timeout(cfg.settle_ms)
-            # 结果是懒加载的，滚几屏把后面的卡片带出来
-            for _ in range(3):
-                await page.mouse.wheel(0, 2200)
-                await page.wait_for_timeout(900)
-            self._assert_not_blocked(page.url)
-
-            data = await page.evaluate(script)
+            data = await self._settle(page, script)
             if cfg.debug_dir and debug_name:
                 await self._dump(page, debug_name)
             return data
@@ -642,7 +897,7 @@ class BrowserSession:
                 await page.goto(url, wait_until="domcontentloaded",
                                 timeout=cfg.timeout_ms)
             except Exception as exc:  # noqa: BLE001
-                raise FetchError(f"打开页面失败: {type(exc).__name__}: {exc}") from exc
+                raise FetchError(f"打开页面失败: {type(exc).__name__}") from exc
             self._assert_not_blocked(page.url)
             try:
                 await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -678,34 +933,71 @@ class BrowserSession:
             return []
         import httpx
 
-        quiet_http_logs()
         headers = {"User-Agent": self.user_agent or self._config.user_agent}
         if referer:
             headers["Referer"] = referer
         # 跳板只是一次解码重定向，实测 0.6s 就够；给太长的超时只会让
         # 个别卡住的链接拖慢整批
         timeout = min(20.0, self._config.timeout_ms / 1000)
-        semaphore = asyncio.Semaphore(concurrency)
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
-        async with httpx.AsyncClient(proxy=self._config.proxy,
-                                     follow_redirects=False,
-                                     timeout=timeout,
-                                     headers=headers) as client:
-            async def resolve(url: str) -> str | None:
-                async with semaphore:
-                    try:
-                        resp = await client.get(url)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("还原跳板失败 %s: %s", url[:70], exc)
-                        return None
-                location = resp.headers.get("location", "")
-                if location.startswith(("http://", "https://")):
-                    return location
-                logger.debug("跳板未返回重定向（status=%s）: %s",
-                             resp.status_code, url[:70])
-                return None
+        client_options: dict[str, Any] = {
+            "follow_redirects": False,
+            "timeout": timeout,
+            "headers": headers,
+            "proxy": self._config.proxy,
+        }
 
-            return list(await asyncio.gather(*(resolve(u) for u in urls)))
+        with quiet_http_logs():
+            async with httpx.AsyncClient(**client_options) as client:
+                async def follow(url: str) -> str | None:
+                    current = url
+                    for _ in range(3):
+                        resp = await client.get(current)
+                        if resp.status_code in (403, 429):
+                            raise RateLimitedError(_CAPTCHA_HINT)
+                        location = resp.headers.get("location", "")
+                        if not location:
+                            logger.debug(
+                                "跳板未返回重定向（status=%s）",
+                                resp.status_code)
+                            return None
+
+                        target = up.urljoin(str(resp.url), location)
+                        if "/sorry/" in target:
+                            raise RateLimitedError(_CAPTCHA_HINT)
+                        if not target.lower().startswith(("http://", "https://")):
+                            logger.debug("跳板返回了非 HTTP(S) 地址")
+                            return None
+                        target_parts = up.urlsplit(target)
+                        current_host = (up.urlsplit(current).hostname or "").lower()
+                        if (target_parts.hostname or "").lower() != current_host:
+                            return target
+                        current = target
+                    logger.debug("跳板重定向次数超过上限")
+                    return None
+
+                async def resolve(url: str) -> str | None:
+                    async with semaphore:
+                        try:
+                            # 把候选的完整跳转链包进同一个截止时间，避免逐跳
+                            # 叠加阶段超时。
+                            return await asyncio.wait_for(
+                                follow(url), timeout=timeout)
+                        except RateLimitedError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("还原跳板失败: %s",
+                                         exception_for_log(exc))
+                            return None
+
+                resolved = await asyncio.gather(
+                    *(resolve(u) for u in urls), return_exceptions=True)
+                for item in resolved:
+                    if isinstance(item, RateLimitedError):
+                        raise item
+                return [item if isinstance(item, str) else None
+                        for item in resolved]
 
     @staticmethod
     def _assert_not_blocked(url: str) -> None:

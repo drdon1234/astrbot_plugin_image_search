@@ -21,11 +21,11 @@ def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _text(value: Any, default: str = "") -> str:
+def _text(value: Any, default: str = "", *, allow_empty: bool = False) -> str:
     if value is None:
         return default
     text = str(value).strip()
-    return text or default
+    return text if (text or allow_empty) else default
 
 
 def _int(value: Any, default: int, minimum: int | None = None,
@@ -66,6 +66,7 @@ class PluginOptions:
         working_hint: 开始搜索时的提示语；留空则不提示。
         request_timeout_seconds: 单次搜索的总超时秒数；0 = 不限制。
             这是最后一道保险 —— 底层卡死时保证用户能收到回复。
+        max_pending_requests: 活动搜索之外最多允许排队的请求数；0 = 忙碌时拒绝。
     """
 
     command: str = DEFAULT_COMMAND
@@ -74,6 +75,7 @@ class PluginOptions:
     idle_close_minutes: int = 30
     working_hint: str = "正在搜索，请稍候……"
     request_timeout_seconds: int = 180
+    max_pending_requests: int = 1
 
 
 @dataclasses.dataclass(slots=True)
@@ -129,7 +131,8 @@ def build_config(raw: Mapping[str, Any] | None,
 
     output = OutputOptions(
         limit=max_results,
-        ai_header=_text(output_raw.get("ai_header"), "【图片描述】"),
+        ai_header=_text(
+            output_raw.get("ai_header"), "【图片描述】", allow_empty=True),
         show_source=_bool(output_raw.get("show_source"), True),
         show_size=_bool(output_raw.get("show_size"), False),
         show_index=_bool(output_raw.get("show_index"), True),
@@ -150,9 +153,12 @@ def build_config(raw: Mapping[str, Any] | None,
                                    minimum=0, maximum=600),
         idle_close_minutes=_int(browser_raw.get("idle_close_minutes"), 30,
                                 minimum=0, maximum=1440),
-        working_hint=_text(output_raw.get("working_hint"), "正在搜索，请稍候……"),
+        working_hint=_text(
+            output_raw.get("working_hint"), "正在搜索，请稍候……", allow_empty=True),
         request_timeout_seconds=_int(limits_raw.get("request_timeout_seconds"),
                                     180, minimum=0, maximum=1800),
+        max_pending_requests=_int(limits_raw.get("max_pending_requests"), 1,
+                                  minimum=0, maximum=10),
     )
 
     return PluginConfig(search=search, output=output, options=options)

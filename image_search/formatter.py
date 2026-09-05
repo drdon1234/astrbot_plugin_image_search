@@ -29,6 +29,7 @@ class OutputOptions:
         header: 完全匹配列表前面的抬头。``{count}`` 会替换成条数，不写也可以。
         ai_header: AI 描述前面的抬头；留空则直接输出描述。
         empty_text: 没有完全匹配结果时的文案。
+        ai_empty_text: 只开启 AI 模式但 Google 没返回描述时的文案。
         expect_exact_matches: 是否开启了完全匹配搜索。开着却一条都没有时，
             要明确告知 ``empty_text``，而不是只把 AI 描述发出去 —— 否则用户
             分不清「没有收录这张图」和「插件没搜完全匹配」。
@@ -52,6 +53,7 @@ class OutputOptions:
     header: str = "找到以下结果"
     ai_header: str = "【图片描述】"
     empty_text: str = "没有找到完全匹配的结果"
+    ai_empty_text: str = "Google 没有返回图片描述"
     expect_exact_matches: bool = True
     use_forward_message: bool = True
     link_as_separate_message: bool = False
@@ -159,7 +161,8 @@ def format_blocks(result: LensSearchResult,
             blocks.insert(0, ai_block)
 
     if not blocks:
-        blocks = [options.empty_text]
+        blocks = [options.empty_text if options.expect_exact_matches
+                  else options.ai_empty_text]
     if options.show_ocr and result.ocr_text:
         blocks.append(f"图中文字：\n{result.ocr_text}")
     return blocks

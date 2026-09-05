@@ -34,15 +34,16 @@ import asyncio
 
 from .browser import BrowserSession
 from .config import SearchConfig
-from .exceptions import ParseError, RateLimitedError
+from .exceptions import FetchError, ParseError, RateLimitedError
 from .loader import ImageInput, load_image
-from .logger import logger
+from .logger import exception_for_log, logger
 from .models import ExactMatch, LensSearchResult
 from .parser import (
     AI_EXTRACT_SCRIPT,
     EXTRACT_SCRIPT,
     RawMatch,
     ai_html_to_text,
+    candidate_limit,
     extract_items,
 )
 from .session import LensSession
@@ -56,7 +57,7 @@ class GoogleLensSearcher:
 
     Example:
         >>> async with GoogleLensSearcher() as searcher:
-        ...     result = await searcher.search("test_imgs/test.png")
+        ...     result = await searcher.search("/path/to/image.png")
         ...     print(result.format())
     """
 
@@ -152,45 +153,110 @@ class GoogleLensSearcher:
             debug_name="lens")
 
         payload = outcome.exact_payload
-        if cfg.exact_matches and not isinstance(payload, dict):
-            raise ParseError(f"页面脚本返回了意外类型: {type(payload).__name__}")
+        exact_error = outcome.exact_error
+        if (cfg.exact_matches and not isinstance(payload, dict)
+                and exact_error is None):
+            exact_error = ParseError(
+                f"完全匹配页面脚本返回了意外类型: {type(payload).__name__}")
 
         ai_summary = ""
+        ai_error = outcome.ai_error
         if isinstance(outcome.ai_payload, dict):
             ai_summary = ai_html_to_text(outcome.ai_payload.get("html") or "")
             logger.debug("AI 描述 %d 字", len(ai_summary))
-        elif cfg.ai_mode:
-            logger.debug("AI 模式没有拿到内容")
+        if cfg.ai_mode and not ai_summary and ai_error is None:
+            ai_error = ParseError(
+                "AI 模式没有返回可用正文，可能尚未生成、拒绝识别或页面结构已变化")
 
-        ocr_text = ""
-        if with_ocr:
-            # OCR 接口同样要求和上传共用会话，浏览器那边取不到，
-            # 所以单独走一次纯 HTTP 的上传 + 查询
-            try:
-                async with LensSession(self.config) as http_session:
-                    ocr_location = await http_session.upload(data, name, mime)
-                    ocr_text = "\n".join(
-                        await http_session.ocr_lines(ocr_location))
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("OCR 获取失败，忽略: %s", exc)
+        if cfg.ai_mode and not cfg.exact_matches and ai_error is not None:
+            raise ai_error
+        if cfg.exact_matches and not cfg.ai_mode and exact_error is not None:
+            raise exact_error
+        if (cfg.exact_matches and cfg.ai_mode and exact_error is not None
+                and not ai_summary):
+            detail = f"完全匹配：{exact_error}"
+            if ai_error is not None:
+                detail += f"；AI 模式：{ai_error}"
+            raise FetchError(f"两种搜索模式均未成功。{detail}")
 
         matches: list[ExactMatch] = []
+        raw_count = 0
+        ocr_task = (asyncio.create_task(self._fetch_ocr(data, name, mime))
+                    if with_ocr else None)
         if isinstance(payload, dict):
-            raw_items = extract_items(payload, cfg.max_results)
-            matches = await self._resolve(raw_items, outcome.exact_url)
-            logger.debug("候选 %d 条，还原出 %d 条", len(raw_items), len(matches))
+            raw_items = extract_items(payload, candidate_limit(cfg.max_results))
+            raw_count = len(raw_items)
+            try:
+                matches = await self._resolve(raw_items, outcome.exact_url)
+            except RateLimitedError:
+                if ocr_task is not None:
+                    ocr_task.cancel()
+                    await asyncio.gather(ocr_task, return_exceptions=True)
+                raise
+            except FetchError as exc:
+                exact_error = exc
+                if not ai_summary:
+                    if ocr_task is not None:
+                        ocr_task.cancel()
+                        await asyncio.gather(ocr_task, return_exceptions=True)
+                    raise
+                logger.warning("完全匹配链接还原失败，返回 AI 模式结果: %s",
+                               exception_for_log(exc))
+            except BaseException:
+                if ocr_task is not None:
+                    ocr_task.cancel()
+                    await asyncio.gather(ocr_task, return_exceptions=True)
+                raise
+            matches = matches[:cfg.max_results]
+            logger.debug("候选 %d 条，还原出 %d 条", raw_count, len(matches))
 
-            if cfg.complete_titles and matches:
-                filled = await complete_titles(matches, cfg)
-                logger.debug("补全了 %d 条标题", filled)
+            try:
+                if cfg.complete_titles and matches:
+                    filled = await complete_titles(matches, cfg)
+                    logger.debug("补全了 %d 条标题", filled)
+            except BaseException:
+                if ocr_task is not None:
+                    ocr_task.cancel()
+                    await asyncio.gather(ocr_task, return_exceptions=True)
+                raise
+
+        try:
+            ocr_text = await ocr_task if ocr_task is not None else ""
+        except BaseException:
+            if ocr_task is not None and not ocr_task.done():
+                ocr_task.cancel()
+                await asyncio.gather(ocr_task, return_exceptions=True)
+            raise
+
+        exact_succeeded = (cfg.exact_matches and isinstance(payload, dict)
+                           and exact_error is None)
+        if cfg.exact_matches and cfg.ai_mode:
+            if exact_error is not None:
+                logger.warning("完全匹配失败，已返回 AI 模式的部分结果: %s",
+                               exception_for_log(exact_error))
+            elif ai_error is not None and exact_succeeded:
+                logger.warning("AI 模式失败，已返回完全匹配的部分结果: %s",
+                               exception_for_log(ai_error))
 
         return LensSearchResult(
             exact_matches=matches,
             ai_summary=ai_summary,
-            result_url=outcome.exact_url or outcome.ai_url,
+            result_url=(outcome.exact_url if exact_succeeded else outcome.ai_url),
             lens_url=outcome.lens_url,
             ocr_text=ocr_text,
         )
+
+    async def _fetch_ocr(self, data: bytes, name: str, mime: str) -> str:
+        """独立完成 OCR；调用方可让它与跳板还原安全重叠。"""
+        try:
+            async with LensSession(self.config) as http_session:
+                location = await http_session.upload(data, name, mime)
+                return "\n".join(await http_session.ocr_lines(location))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("OCR 获取失败，忽略: %s", exception_for_log(exc))
+            return ""
 
     async def _resolve(self, raw_items: list[RawMatch],
                        referer: str) -> list[ExactMatch]:
@@ -210,6 +276,10 @@ class GoogleLensSearcher:
             if not url:
                 continue
             matches.append(raw.to_exact_match(url))
+        if raw_items and not matches:
+            raise FetchError(
+                f"页面抽取到 {len(raw_items)} 条候选，但所有来源链接都还原失败；"
+                "请检查代理或 Google 跳板访问是否正常")
         return matches
 
 

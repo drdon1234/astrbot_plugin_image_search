@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import SOCS_COOKIE, SearchConfig
 from .exceptions import FetchError, UploadError
-from .logger import quiet_http_logs
+from .logger import exception_for_log, logger, quiet_http_logs
 from .metadata import QF_METADATA_URL, build_metadata_params, parse_ocr_lines
 from .uploader import UPLOAD_URL, build_upload_params
 
@@ -37,22 +37,25 @@ class LensSession:
         if self._client is None:
             import httpx
 
-            quiet_http_logs()
-            self._client = httpx.AsyncClient(
-                timeout=self._config.timeout_ms / 1000,
-                follow_redirects=False,
-                proxy=self._config.proxy,
-                headers={
-                    "User-Agent": self._config.user_agent,
-                    "Accept-Language": f"{self._config.hl}-US,{self._config.hl};q=0.9",
-                },
-            )
-            self._client.cookies.set("SOCS", SOCS_COOKIE, domain=".google.com")
+            with quiet_http_logs():
+                self._client = httpx.AsyncClient(
+                    timeout=self._config.timeout_ms / 1000,
+                    follow_redirects=False,
+                    proxy=self._config.proxy,
+                    headers={
+                        "User-Agent": self._config.user_agent,
+                        "Accept-Language":
+                            f"{self._config.hl}-US,{self._config.hl};q=0.9",
+                    },
+                )
+                self._client.cookies.set(
+                    "SOCS", SOCS_COOKIE, domain=".google.com")
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None:
-            await self._client.aclose()
+            with quiet_http_logs():
+                await self._client.aclose()
             self._client = None
 
     async def __aenter__(self) -> LensSession:
@@ -84,15 +87,17 @@ class LensSession:
 
         client = await self._http_client()
         try:
-            resp = await client.post(
-                UPLOAD_URL, params=params,
-                files={"encoded_image": (filename, image, mime)},
-                headers={**headers,
-                         "Accept": "text/html,application/xhtml+xml,"
-                                   "application/xml;q=0.9,*/*;q=0.8"},
-            )
+            with quiet_http_logs():
+                resp = await client.post(
+                    UPLOAD_URL, params=params,
+                    files={"encoded_image": (filename, image, mime)},
+                    headers={**headers,
+                             "Accept": "text/html,application/xhtml+xml,"
+                                       "application/xml;q=0.9,*/*;q=0.8"},
+                )
         except Exception as exc:  # noqa: BLE001
-            raise UploadError(f"上传请求失败: {type(exc).__name__}: {exc}") from exc
+            logger.debug("上传请求失败: %s", exception_for_log(exc))
+            raise UploadError(f"上传请求失败: {type(exc).__name__}") from exc
 
         location = resp.headers.get("location", "")
         if resp.status_code not in _REDIRECT_CODES or not location:
@@ -134,9 +139,13 @@ class LensSession:
 
         client = await self._http_client()
         try:
-            resp = await client.get(QF_METADATA_URL, params=params, headers=headers)
+            with quiet_http_logs():
+                resp = await client.get(
+                    QF_METADATA_URL, params=params, headers=headers)
         except Exception as exc:  # noqa: BLE001
-            raise FetchError(f"qfmetadata 请求失败: {type(exc).__name__}: {exc}") from exc
+            logger.debug("qfmetadata 请求失败: %s", exception_for_log(exc))
+            raise FetchError(
+                f"qfmetadata 请求失败: {type(exc).__name__}") from exc
         if resp.status_code != 200:
             raise FetchError(f"qfmetadata 返回 {resp.status_code}")
         return parse_ocr_lines(resp.text)

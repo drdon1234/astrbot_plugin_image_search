@@ -5,7 +5,7 @@
 （``python tools/scan_nodes.py``），换不动再用这个。
 
     python tools/solve_captcha.py
-    python tools/solve_captcha.py --node "US-01" --wait 300
+    python tools/solve_captcha.py --node <节点名> --wait 300
 """
 
 from __future__ import annotations
@@ -39,11 +39,11 @@ async def main() -> int:
 
         original = get_proxies().get(args.group, {}).get("now")
         switch(args.group, args.node)
-        print(f"已把 {args.group}: {original} -> {args.node}")
+        print("已切换到指定代理节点")
         await asyncio.sleep(2)
 
     config = SearchConfig(headless=False, use_cdp=True, proxy=args.proxy)
-    print(f"profile 目录: {config.resolved_user_data_dir()}")
+    print("浏览器 profile 已准备")
 
     session = BrowserSession(config)
     await session.start()
@@ -68,9 +68,8 @@ async def main() -> int:
 
         names = [c["name"] for c in await session.context.cookies()]
         print("[+] 验证通过，已回到搜索页")
-        print(f"    cookies: {names}")
         if "GOOGLE_ABUSE_EXEMPTION" in names:
-            print("    已获得 GOOGLE_ABUSE_EXEMPTION，profile 已持久化")
+            print("    验证豁免状态已写入持久化 profile")
         return 0
     finally:
         await page.close()
@@ -80,9 +79,10 @@ async def main() -> int:
 
             try:
                 switch(args.group, original)
-                print(f"已把 {args.group} 恢复为 {original}")
+                print("已恢复原代理选择")
             except Exception as exc:  # noqa: BLE001
-                print(f"!! 恢复失败，请手动选回 {original}: {exc}")
+                print(f"!! 恢复原代理选择失败，请手动恢复："
+                      f"{type(exc).__name__}")
 
 
 if __name__ == "__main__":

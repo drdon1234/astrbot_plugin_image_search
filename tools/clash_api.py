@@ -8,8 +8,14 @@ Clash Verge 默认把 external-controller 关掉，只留 ``\\.\pipe\verge-mihom
 * 测节点延迟
 
     python tools/clash_api.py list
+    python tools/clash_api.py list --show-names
     python tools/clash_api.py groups
+    python tools/clash_api.py groups --show-names
     python tools/clash_api.py switch <组名> <节点名>
+
+``list`` / ``groups`` 默认只显示数量与类型等非名称信息。只有明确传入
+``--show-names`` 时才显示代理组名、节点名或当前节点名。``switch`` 的输出
+始终不回显传入名称。
 """
 
 from __future__ import annotations
@@ -103,47 +109,102 @@ def _dechunk(body: bytes) -> bytes:
 def get_proxies() -> dict[str, Any]:
     status, data = request("GET", "/proxies")
     if status != 200 or not isinstance(data, dict):
-        raise RuntimeError(f"/proxies 返回异常: {status} {str(data)[:200]}")
-    return data.get("proxies", {})
+        raise RuntimeError("读取代理信息失败")
+    proxies = data.get("proxies")
+    if not isinstance(proxies, dict):
+        raise RuntimeError("代理信息格式异常")
+    return proxies
 
 
 def selector_groups(proxies: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {name: info for name, info in proxies.items()
-            if info.get("type") in ("Selector", "URLTest", "Fallback",
-                                    "LoadBalance")}
+            if isinstance(info, dict)
+            and info.get("type") in ("Selector", "URLTest", "Fallback",
+                                     "LoadBalance")}
 
 
 def switch(group: str, node: str) -> None:
     import urllib.parse
 
-    status, data = request("PUT", f"/proxies/{urllib.parse.quote(group)}",
-                           {"name": node})
+    try:
+        status, _ = request("PUT", f"/proxies/{urllib.parse.quote(group)}",
+                            {"name": node})
+    except Exception:  # noqa: BLE001
+        raise RuntimeError("切换失败") from None
     if status not in (200, 204):
-        raise RuntimeError(f"切换失败: {status} {str(data)[:200]}")
+        raise RuntimeError("切换失败")
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
+def _real_nodes(proxies: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    group_types = {
+        "Selector", "URLTest", "Fallback", "LoadBalance", "Direct",
+        "Reject", "Compatible", "Pass", "RejectDrop",
+    }
+    return {
+        name: info
+        for name, info in proxies.items()
+        if isinstance(info, dict) and info.get("type") not in group_types
+    }
+
+
+def _show_names(args: list[str]) -> bool | None:
+    if not args:
+        return False
+    if args == ["--show-names"]:
+        return True
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args == ["--help"] or args == ["-h"]:
         print(__doc__)
-        return 1
-    cmd = sys.argv[1]
-    proxies = get_proxies()
+        return 0 if args else 1
+    cmd = args[0]
 
     if cmd == "list":
-        real = {n: i for n, i in proxies.items()
-                if i.get("type") not in ("Selector", "URLTest", "Fallback",
-                                         "LoadBalance", "Direct", "Reject",
-                                         "Compatible", "Pass", "RejectDrop")}
-        print(f"共 {len(real)} 个节点：")
-        for name in real:
-            print("  ", name)
+        show_names = _show_names(args[1:])
+        if show_names is None:
+            print(__doc__)
+            return 1
+        try:
+            real = _real_nodes(get_proxies())
+        except Exception:  # noqa: BLE001
+            print("读取代理信息失败", file=sys.stderr)
+            return 2
+        ending = "：" if show_names else "。"
+        print(f"共 {len(real)} 个节点{ending}")
+        if show_names:
+            for name in real:
+                print("  ", name)
     elif cmd == "groups":
-        for name, info in selector_groups(proxies).items():
-            print(f"[{info['type']}] {name}  当前={info.get('now')}  "
-                  f"候选={len(info.get('all') or [])}")
-    elif cmd == "switch" and len(sys.argv) >= 4:
-        switch(sys.argv[2], sys.argv[3])
-        print(f"已把 {sys.argv[2]} 切到 {sys.argv[3]}")
+        show_names = _show_names(args[1:])
+        if show_names is None:
+            print(__doc__)
+            return 1
+        try:
+            groups = selector_groups(get_proxies())
+        except Exception:  # noqa: BLE001
+            print("读取代理信息失败", file=sys.stderr)
+            return 2
+        print(f"共 {len(groups)} 个代理组：")
+        for index, (name, info) in enumerate(groups.items(), start=1):
+            candidates = len(info.get("all") or [])
+            if show_names:
+                print(f"[{info['type']}] {name}  当前={info.get('now')}  "
+                      f"候选={candidates}")
+            else:
+                print(f"  组 {index} [{info['type']}] 候选={candidates}")
+    elif cmd == "switch":
+        if len(args) != 3:
+            print("用法: python tools/clash_api.py switch <组名> <节点名>")
+            return 1
+        try:
+            switch(args[1], args[2])
+        except Exception:  # noqa: BLE001
+            print("切换失败", file=sys.stderr)
+            return 2
+        print("切换成功")
     else:
         print(__doc__)
         return 1

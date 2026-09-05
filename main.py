@@ -16,19 +16,28 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import math
 import time
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .image_search import __version__
 from .image_search.exceptions import (
     BrowserNotAvailableError,
+    FetchError,
+    ImageInputError,
     ImageSearchError,
+    ParseError,
     RateLimitedError,
+    SearchBusyError,
+    SearchTimeoutError,
+    UploadError,
 )
 from .image_search.formatter import format_blocks, format_result
-from .image_search.logger import logger
+from .image_search.logger import exception_for_log, logger, sanitize_log_text
 from .image_search.models import LensSearchResult
 from .image_search.plugin_config import build_config
 from .image_search.service import LensSearchService
@@ -66,8 +75,8 @@ STATUS_PATTERN = (
 @register(
     PLUGIN_NAME,
     "drdon1234",
-    "用 Google Lens 反向搜图，解析完全匹配结果并返回来源链接与标题",
-    "0.1.0",
+    "基于 Google Lens 反向搜图，返回 AI 图片描述与完全匹配来源链接",
+    __version__,
 )
 class ImageSearchPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
@@ -76,9 +85,12 @@ class ImageSearchPlugin(Star):
         self.service = LensSearchService(
             self.config.search,
             idle_close_seconds=self.config.options.idle_close_minutes * 60,
+            max_pending_searches=self.config.options.max_pending_requests,
         )
         self._cooldown: dict[str, float] = {}
+        self._inflight_users: set[str] = set()
         self._prepare_task: asyncio.Task[None] | None = None
+        self._terminating = False
         logger.info(
             "%s 已加载：指令=%s，最多返回 %d 条，浏览器空闲 %d 分钟后关闭",
             PLUGIN_NAME,
@@ -89,24 +101,30 @@ class ImageSearchPlugin(Star):
         self._schedule_prepare()
 
     # -- 浏览器预备 ---------------------------------------------------------
-    def _schedule_prepare(self) -> None:
+    def _schedule_prepare(self) -> bool:
         """后台补齐浏览器。
 
         AstrBot 装插件只会装 pip 依赖，不会执行 ``playwright install``，所以
         官方镜像里浏览器二进制是缺的。这里在插件加载后丢到后台下载，避免用户
         第一次搜图时干等几分钟。不阻塞加载，失败也只记日志。
         """
+        if self._terminating:
+            return False
         if self._prepare_task is not None:
-            return
+            if not self._prepare_task.done():
+                return False
+            self._prepare_task = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # 没有运行中的事件循环，交给 on_astrbot_loaded 或首次搜索时兜底
             logger.debug("插件加载时没有事件循环，浏览器预备延后")
-            return
+            return False
         self._prepare_task = loop.create_task(self._prepare_browser())
+        return True
 
     async def _prepare_browser(self) -> None:
+        current = asyncio.current_task()
         try:
             if self.service.browser_ready():
                 logger.info("浏览器已就绪")
@@ -116,7 +134,10 @@ class ImageSearchPlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning("后台准备浏览器失败: %s", exc)
+            logger.warning("后台准备浏览器失败: %s", exception_for_log(exc))
+        finally:
+            if self._prepare_task is current:
+                self._prepare_task = None
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
@@ -129,17 +150,39 @@ class ImageSearchPlugin(Star):
         try:
             return StarTools.get_data_dir(PLUGIN_NAME)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取插件数据目录失败，用默认位置: %s", exc)
+            logger.debug("取插件数据目录失败，用默认位置: %s",
+                         exception_for_log(exc))
             return None
 
     async def terminate(self) -> None:
+        self._terminating = True
+        cleanup_pending = False
+        cleanup_failed = False
         task = self._prepare_task
-        self._prepare_task = None
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        await self.service.close()
-        logger.info("%s 已卸载，浏览器已关闭", PLUGIN_NAME)
+            done, _ = await asyncio.wait({task}, timeout=10)
+            if task in done:
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                cleanup_pending = True
+                logger.error("取消浏览器预备任务超过 10 秒，停止等待")
+        try:
+            await asyncio.wait_for(
+                self.service.close(cancel_active=True), timeout=25)
+        except asyncio.TimeoutError:
+            cleanup_pending = True
+            logger.error("插件卸载时关闭浏览器超过 25 秒，停止等待")
+        except Exception as exc:  # noqa: BLE001
+            cleanup_failed = True
+            logger.warning("插件卸载时关闭浏览器失败: %s",
+                           exception_for_log(exc))
+        if cleanup_failed:
+            logger.info("%s 已卸载，但浏览器关闭流程失败", PLUGIN_NAME)
+        elif cleanup_pending:
+            logger.info("%s 已卸载，超时的资源清理仍在后台收尾", PLUGIN_NAME)
+        else:
+            logger.info("%s 已卸载，浏览器关闭流程已结束", PLUGIN_NAME)
 
     # -- 指令 ---------------------------------------------------------------
     @filter.regex(TRIGGER_PATTERN)
@@ -158,40 +201,56 @@ class ImageSearchPlugin(Star):
            时而不被折叠。``event.send()`` 直连平台适配器，绕过整个装饰阶段，
            要不要合并转发完全由本插件的配置说了算。
         """
-        limited = self._check_cooldown(event)
+        mode_error = self._mode_error()
+        if mode_error:
+            await event.send(event.plain_result(mode_error))
+            return
+
+        request_key, limited = self._begin_user_request(event)
         if limited:
             await event.send(event.plain_result(limited))
             return
 
-        # 浏览器还在后台装的时候，给个明确的进度而不是一句失败
-        if not self.service.browser_ready():
-            self._schedule_prepare()
-            await event.send(event.plain_result(
-                f"{self.service.install_status()}\n装好后再发一次就行。"))
-            return
-
-        image = self._pick_image(event)
-        if image is None:
-            image = await self._wait_for_image(event)
-            if image is None:
+        start_cooldown = False
+        try:
+            # 浏览器还在后台装的时候，给个明确的进度而不是一句失败
+            if not self.service.browser_ready():
+                self._schedule_prepare()
+                await event.send(event.plain_result(
+                    f"{self.service.install_status()}\n装好后再发一次就行。"))
                 return
 
-        hint = self.config.options.working_hint
-        if hint:
-            await event.send(event.plain_result(hint))
+            image = self._pick_image(event)
+            if image is None:
+                image = await self._wait_for_image(event)
+                if image is None:
+                    return
 
-        try:
-            payload = await image.convert_to_file_path()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("获取图片失败: %s", exc)
-            await event.send(event.plain_result("拿不到这张图片，换一张再试试"))
-            return
+            hint = self.config.options.working_hint
+            if hint:
+                await event.send(event.plain_result(hint))
 
-        outcome = await self._search(payload)
-        if isinstance(outcome, str):
-            await event.send(event.plain_result(outcome))
-            return
-        await self._send_result(event, outcome)
+            try:
+                payload = await image.convert_to_file_path()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("获取图片失败: %s", exception_for_log(exc))
+                await event.send(event.plain_result("拿不到这张图片，换一张再试试"))
+                return
+
+            try:
+                outcome = await self._search(payload)
+            except SearchBusyError as exc:
+                logger.info("搜图请求未进入队列: %s", exc)
+                await event.send(event.plain_result(str(exc)))
+                return
+            start_cooldown = True
+            if isinstance(outcome, str):
+                await event.send(event.plain_result(outcome))
+                return
+            await self._send_result(event, outcome)
+        finally:
+            self._finish_user_request(
+                request_key, start_cooldown=start_cooldown)
 
     async def _send_result(self, event: AstrMessageEvent,
                            result: LensSearchResult) -> None:
@@ -207,7 +266,11 @@ class ImageSearchPlugin(Star):
             except Exception as exc:  # noqa: BLE001
                 # 合并转发是 QQ 特有的，其它平台会失败。回退成普通消息，
                 # 总比什么都收不到好。
-                logger.warning("合并转发发送失败，回退为普通消息: %s", exc)
+                logger.warning("合并转发发送失败，回退为普通消息: %s",
+                               exception_for_log(exc))
+                plain_options = dataclasses.replace(
+                    self.config.output, use_forward_message=False)
+                blocks = format_blocks(result, plain_options)
         for block in blocks:
             await event.send(event.plain_result(block))
 
@@ -216,13 +279,16 @@ class ImageSearchPlugin(Star):
         try:
             uin = str(event.get_self_id() or "0")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取机器人自身 id 失败: %s", exc)
+            logger.debug("取机器人自身 id 失败: %s", exception_for_log(exc))
             uin = "0"
         return self.config.options.command, uin
 
     # -- 内部实现 -----------------------------------------------------------
     async def _run_search(self, image_path: str) -> str:
         """搜索并把结果拼成一段文本。给 LLM 工具和校验脚本用。"""
+        mode_error = self._mode_error()
+        if mode_error:
+            return mode_error
         outcome = await self._search(image_path)
         if isinstance(outcome, str):
             return outcome
@@ -231,22 +297,23 @@ class ImageSearchPlugin(Star):
     async def _search(self, image_path: str) -> LensSearchResult | str:
         """执行搜索。成功返回结果对象，失败返回可直接发送的错误文案。
 
-        整个搜索套了一层总超时。底层卡死时用户必须能收到明确回复 —— 实测过一种
+        服务在取得串行执行权后才开始计算总超时。底层卡死时用户必须能收到明确
+        回复 —— 实测过一种
         情况：AstrBot 运行期间 pip 升级了 playwright，旧客户端配新 driver 会让
         Playwright 的连接层静默挂死，我们传给它的 timeout 一概无效，
         用户只收到「正在搜索」就再也没有下文。
         """
         timeout = self.config.options.request_timeout_seconds
-        search = self.service.search(
-            image_path, with_ocr=self.config.output.show_ocr)
         try:
-            if timeout > 0:
-                result = await asyncio.wait_for(search, timeout)
-            else:
-                result = await search
-        except asyncio.TimeoutError:
-            logger.error("搜索超过 %d 秒没有返回，强制关闭浏览器会话", timeout)
-            await self._force_close()
+            result = await self.service.search(
+                image_path,
+                with_ocr=self.config.output.show_ocr,
+                timeout_seconds=timeout,
+            )
+        except SearchBusyError:
+            raise
+        except SearchTimeoutError:
+            logger.error("搜索取得执行权后超过 %d 秒没有返回", timeout)
             return (f"搜索超时（{timeout} 秒无响应），已重置浏览器会话。\n"
                     "请稍后重试。若反复出现，请让管理员查看日志，"
                     "并确认升级过依赖后重启了 AstrBot。")
@@ -255,46 +322,76 @@ class ImageSearchPlugin(Star):
             return ("Google 触发了人机验证，暂时搜不了。稍后再试，"
                     "或让管理员换个代理节点。")
         except BrowserNotAvailableError as exc:
-            logger.error("浏览器不可用: %s", exc)
-            return f"浏览器启动失败，请让管理员检查部署环境：\n{exc}"
+            logger.error("浏览器不可用: %s", exception_for_log(exc))
+            return ("浏览器启动失败，请让管理员发送 /搜图状态，"
+                    "并查看 AstrBot 日志")
         except ImageSearchError as exc:
-            logger.warning("搜索失败: %s: %s", type(exc).__name__, exc)
-            return f"搜索失败：{exc}"
+            logger.warning("搜索失败: %s", exception_for_log(exc))
+            return self._user_error(exc)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("搜图出现未预期的错误: %s", exc)
+            # traceback 会原样包含请求 URL 和本地源码路径，这里只记脱敏诊断。
+            logger.error("搜图出现未预期的错误: %s", exception_for_log(exc))
             return "搜索出错了，详情见 AstrBot 日志"
         return result
 
-    async def _force_close(self) -> None:
-        """强制释放浏览器会话，让下一次搜索从干净状态重新开始。
+    @staticmethod
+    def _user_error(exc: ImageSearchError) -> str:
+        """把业务异常收敛为不含部署细节的用户文案。"""
+        if isinstance(exc, UploadError):
+            return "图片上传失败，请稍后重试"
+        if isinstance(exc, FetchError):
+            return "获取搜索结果失败，请稍后重试"
+        if isinstance(exc, ParseError):
+            return "无法解析搜索结果，Google 页面结构可能已变化"
+        if isinstance(exc, ImageInputError):
+            # 输入错误由 loader 生成，文字本来就面向用户；仍做一次脱敏，
+            # 以防文件系统或 HTTP 库细节被拼入异常。
+            return f"搜索失败：{sanitize_log_text(exc)}"
+        return "搜索失败，请稍后重试"
 
-        底层卡死时 ``close()`` 自己也可能卡（它同样要等 Playwright 响应），
-        所以再套一层超时；实在关不掉就只记日志，至少不要把这次请求也拖住。
-        """
-        try:
-            await asyncio.wait_for(self.service.close(), timeout=20)
-        except asyncio.TimeoutError:
-            logger.error("关闭浏览器会话同样超时，可能需要重启 AstrBot")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("关闭浏览器会话失败: %s", exc)
-
-    def _check_cooldown(self, event: AstrMessageEvent) -> str:
-        """返回非空字符串表示还在冷却中。"""
-        seconds = self.config.options.user_cooldown_seconds
-        if seconds <= 0:
+    def _mode_error(self) -> str:
+        if self.config.search.exact_matches or self.config.search.ai_mode:
             return ""
-        key = event.unified_msg_origin + "|" + str(event.get_sender_id())
+        return ("搜图功能未启用：请让管理员至少开启“返回完全匹配结果”或"
+                "“返回 AI 图片描述”之一。")
+
+    @staticmethod
+    def _user_request_key(event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}|{event.get_sender_id()}"
+
+    def _begin_user_request(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """原子登记用户流程；返回 ``(key, 拒绝文案)``。"""
+        key = self._user_request_key(event)
+        if key in self._inflight_users:
+            return key, "你已有一个搜图请求正在处理中，请等待当前结果"
+
+        seconds = self.config.options.user_cooldown_seconds
+        if seconds > 0:
+            now = time.monotonic()
+            last = self._cooldown.get(key, 0.0)
+            remaining = seconds - (now - last)
+            if remaining > 0:
+                return key, f"搜图冷却中，还需 {math.ceil(remaining)} 秒"
+
+        self._inflight_users.add(key)
+        return key, ""
+
+    def _finish_user_request(self, key: str, *, start_cooldown: bool) -> None:
+        """释放用户流程，并从实际搜索完成时开始计冷却。"""
+        self._inflight_users.discard(key)
+        seconds = self.config.options.user_cooldown_seconds
+        if not start_cooldown or seconds <= 0:
+            return
+
         now = time.monotonic()
-        last = self._cooldown.get(key, 0.0)
-        remaining = seconds - (now - last)
-        if remaining > 0:
-            return f"搜图冷却中，还需 {remaining:.0f} 秒"
         self._cooldown[key] = now
-        # 顺手清掉过期记录，避免长期运行后字典无限增长
         if len(self._cooldown) > 256:
             cutoff = now - seconds
-            self._cooldown = {k: v for k, v in self._cooldown.items() if v > cutoff}
-        return ""
+            self._cooldown = {
+                item_key: finished_at
+                for item_key, finished_at in self._cooldown.items()
+                if finished_at > cutoff
+            }
 
     @staticmethod
     def _images_in(components) -> list[Image]:
@@ -308,7 +405,7 @@ class ImageSearchPlugin(Star):
             return images[0]
         for component in messages:
             if isinstance(component, Reply):
-                replied = self._images_in(component.chain)
+                replied = self._images_in(getattr(component, "chain", None))
                 if replied:
                     return replied[0]
         return None
@@ -326,20 +423,27 @@ class ImageSearchPlugin(Star):
                 session_waiter,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("当前 AstrBot 版本不支持 session_waiter: %s", exc)
+            logger.debug("当前 AstrBot 版本不支持 session_waiter: %s",
+                         exception_for_log(exc))
             await event.send(event.plain_result("请在指令里带上图片，或引用一条图片消息"))
             return None
 
         await event.send(event.plain_result(f"请在 {seconds} 秒内发送要搜索的图片"))
         picked: list[Image] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
 
         @session_waiter(timeout=seconds)
         async def waiter(controller: SessionController, next_event: AstrMessageEvent):
-            images = self._images_in(next_event.get_messages())
-            if not images:
-                controller.keep(timeout=seconds, reset_timeout=True)
+            image = self._pick_image(next_event)
+            if image is None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    controller.stop()
+                    return
+                controller.keep(timeout=remaining, reset_timeout=True)
                 return
-            picked.append(images[0])
+            picked.append(image)
             # 只终止补图那条消息的传播，别让它再去触发别的插件。
             #
             # 这里绝对不能动原来那个指令事件：``stop_event()`` 会把
@@ -355,10 +459,14 @@ class ImageSearchPlugin(Star):
             await event.send(event.plain_result("等待超时，已取消搜图"))
             return None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("等待图片时出错: %s", exc)
+            logger.warning("等待图片时出错: %s", exception_for_log(exc))
+            await event.send(event.plain_result("等待图片时出错，已取消搜图，请重新发送"))
             return None
 
-        return picked[0] if picked else None
+        if not picked:
+            await event.send(event.plain_result("等待超时，已取消搜图"))
+            return None
+        return picked[0]
 
     @filter.regex(STATUS_PATTERN)
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -370,15 +478,19 @@ class ImageSearchPlugin(Star):
             f"浏览器: {'已就绪' if ready else '缺失'}",
             f"安装状态: {self.service.install_status()}",
             f"浏览器进程: {'运行中' if self.service.running else '未启动'}",
-            f"代理: {self.config.search.proxy or '未配置（直连）'}",
+            f"搜索任务: {'执行中' if self.service.active else '空闲'}"
+            f"（排队 {self.service.queued}）",
+            f"代理: {'已配置' if self.config.search.proxy else '未显式配置（由环境决定）'}",
             f"自动安装: {'开' if self.config.search.auto_install_browser else '关'}",
-            f"合并转发: {'开' if output.use_forward_message else '关'}"
-            f"　链接单独成条: {'开' if output.link_as_separate_message else '关'}"
+            f"合并转发: {'开' if output.use_forward_message else '关'}",
+            f"链接单独成条: {'开' if output.link_as_separate_message else '关'}",
             f"　描述与结果合并: {'开' if output.merge_ai_and_exact else '关'}",
         ]
         if not ready:
-            self._schedule_prepare()
-            lines.append("已触发后台安装，稍后再查。")
+            if self._schedule_prepare():
+                lines.append("已触发后台安装，稍后再查。")
+            elif self._prepare_task is not None:
+                lines.append("后台安装正在进行，稍后再查。")
         await event.send(event.plain_result("\n".join(lines)))
 
     # -- 给 LLM 用的函数工具 -------------------------------------------------
@@ -391,6 +503,28 @@ class ImageSearchPlugin(Star):
             image_url(string): 图片的 http(s) 地址
         """
         url = (image_url or "").strip()
-        if not url.startswith(("http://", "https://")):
+        if not url.lower().startswith(("http://", "https://")):
             return "image_url 需要是 http(s) 图片地址"
-        return await self._run_search(url)
+        mode_error = self._mode_error()
+        if mode_error:
+            return mode_error
+        if not self.service.browser_ready():
+            self._schedule_prepare()
+            return f"{self.service.install_status()}\n装好后再试一次。"
+
+        request_key, limited = self._begin_user_request(event)
+        if limited:
+            return limited
+
+        start_cooldown = False
+        try:
+            try:
+                result = await self._run_search(url)
+            except SearchBusyError as exc:
+                logger.info("LLM 搜图请求未进入队列: %s", exc)
+                return str(exc)
+            start_cooldown = True
+            return result
+        finally:
+            self._finish_user_request(
+                request_key, start_cooldown=start_cooldown)

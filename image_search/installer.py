@@ -6,7 +6,7 @@
 实测还发现两个坑：
 
 * 镜像缺 Chromium 运行所需的系统库（``libnss3`` / ``libatk-1.0`` / ``libcups``），
-  光 ``playwright install chromium`` 会下载成功但启动失败，必须 ``--with-deps``。
+  光 ``playwright install chromium`` 会下载成功但启动失败，必须另行补齐依赖。
 * ``~/.cache`` 在容器 overlay 文件系统上，不是挂载卷。装到默认位置的话，
   容器一重建浏览器就没了。
 
@@ -20,15 +20,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import importlib.util
+import json
 import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 
-from .logger import logger
+from .logger import (
+    exception_for_log,
+    logger,
+    path_for_log,
+    sanitize_log_text,
+)
 
 #: ``chromium-<rev>/`` 里可执行文件的相对位置。
 #: Playwright 1.5x 之后换成了 Chrome for Testing 构建，目录名从
@@ -57,6 +65,7 @@ _REQUIRED_LIBS = (
     "libXcomposite.so.1", "libXdamage.so.1", "libXfixes.so.3", "libXrandr.so.2",
 )
 _REVISION_RE = re.compile(r"-(\d+)$")
+_MANAGED_COMPLETE_NAME = ".astrbot-install-complete.json"
 
 #: 自己兜底装依赖时用的包清单。每组是同一个库在不同发行版上的候选名，
 #: 取 apt 里有候选版本的第一个 —— Debian 13 因为 64-bit time_t 迁移
@@ -99,6 +108,7 @@ class InstallState(str, enum.Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     SKIPPED = "skipped"
 
 
@@ -109,12 +119,78 @@ def default_browsers_dir(data_dir: pathlib.Path | None) -> pathlib.Path:
     return base / "ms-playwright"
 
 
+def playwright_browsers_dirs() -> tuple[pathlib.Path, ...]:
+    """返回 Playwright 自身可能使用的浏览器缓存目录，不启动 driver。"""
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured and configured != "0":
+        return (pathlib.Path(configured).expanduser(),)
+
+    if configured == "0":
+        spec = importlib.util.find_spec("playwright")
+        if spec and spec.origin:
+            package = pathlib.Path(spec.origin).parent
+            return (
+                package / ".local-browsers",
+                package / "driver" / "package" / ".local-browsers",
+            )
+        return ()
+
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        return ((pathlib.Path(local) / "ms-playwright",) if local else ())
+    if sys.platform == "darwin":
+        return (pathlib.Path.home() / "Library" / "Caches" / "ms-playwright",)
+    cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"))
+    return (cache / "ms-playwright",)
+
+
+def find_default_chromium() -> str | None:
+    """查找当前 Playwright 版本配套的完整 Chromium。"""
+    for directory in playwright_browsers_dirs():
+        executable = find_current_chromium_in(directory)
+        if executable:
+            return executable
+    return None
+
+
+def playwright_chromium_revision() -> str | None:
+    """从 Playwright 自带清单读取当前客户端要求的 Chromium revision。"""
+    spec = importlib.util.find_spec("playwright")
+    if not spec or not spec.origin:
+        return None
+    manifest = pathlib.Path(spec.origin).parent / "driver" / "package" / "browsers.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for item in data.get("browsers") or []:
+        if isinstance(item, dict) and item.get("name") == "chromium":
+            revision = item.get("revision")
+            return str(revision) if revision else None
+    return None
+
+
+def find_current_chromium_in(root: pathlib.Path | str | None) -> str | None:
+    """在目录中查找与当前 Playwright 客户端 revision 完全一致的浏览器。"""
+    revision = playwright_chromium_revision()
+    if revision is None:
+        return None
+    directory = pathlib.Path(root) if root else None
+    if directory is None:
+        return None
+    return _executable_in_revision(directory / f"chromium-{revision}")
+
+
 def _executable_in_revision(revision_dir: pathlib.Path) -> str | None:
     """在单个 ``chromium-<rev>/`` 目录里定位可执行文件。
 
     先按已知的相对路径直接命中（快），都不中再有界扫描一遍 ——
     这样 Playwright 以后再改目录名也不会直接失效。
     """
+    # Playwright 在整个 revision 落盘完毕后才写这个标记。没有标记的目录
+    # 可能是超时或取消留下的半成品，绝不能被当成可用浏览器。
+    if not (revision_dir / "INSTALLATION_COMPLETE").is_file():
+        return None
     for relative in _CHROMIUM_RELATIVE:
         candidate = revision_dir / relative
         if candidate.is_file():
@@ -151,6 +227,28 @@ def find_chromium_in(root: pathlib.Path | str | None) -> str | None:
         return None
     found.sort(key=lambda item: item[0], reverse=True)
     return found[0][1]
+
+
+def find_managed_chromium_in(root: pathlib.Path | str | None) -> str | None:
+    """查找已走完本插件下载与依赖检查流程的当前 Chromium。"""
+    if not root:
+        return None
+    directory = pathlib.Path(root)
+    executable = find_current_chromium_in(directory)
+    marker = directory / _MANAGED_COMPLETE_NAME
+    if not executable or not marker.is_file():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        relative = pathlib.Path(executable).relative_to(directory).as_posix()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if (data.get("revision") != playwright_chromium_revision()
+            or data.get("executable") != relative):
+        return None
+    return executable
 
 
 def missing_system_libs() -> list[str]:
@@ -203,6 +301,7 @@ class BrowserInstaller:
         #: 安装完成后仍然缺失的依赖库
         self.missing_libs: list[str] = []
         self._lock = asyncio.Lock()
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     # -- 状态 --------------------------------------------------------------
     @property
@@ -218,6 +317,8 @@ class BrowserInstaller:
             return f"浏览器正在自动安装中（已用时 {self.elapsed:.0f} 秒，首次约需 2~5 分钟）"
         if self.state is InstallState.FAILED:
             return f"浏览器自动安装失败：{self.last_error}"
+        if self.state is InstallState.CANCELLED:
+            return "浏览器自动安装已取消，可在下次检查或搜索时重新触发"
         if self.state is InstallState.DONE:
             text = f"浏览器已安装完成（耗时 {self.elapsed:.0f} 秒）"
             if self.missing_libs:
@@ -233,28 +334,26 @@ class BrowserInstaller:
 
     def installed_path(self) -> str | None:
         """已经装好的 Chromium 路径，没有则 None。"""
-        return find_chromium_in(self.install_dir)
+        return find_managed_chromium_in(self.install_dir)
 
     # -- 安装 --------------------------------------------------------------
     async def ensure(self) -> str | None:
         """确保浏览器存在，返回可执行文件路径。已在装则等它装完。"""
         existing = self.installed_path()
         if existing:
-            self.state = InstallState.DONE
+            self._mark_existing()
             return existing
 
         async with self._lock:
             # 可能在排队期间已被别的调用装好
             existing = self.installed_path()
             if existing:
-                self.state = InstallState.DONE
+                self._mark_existing()
                 return existing
             if not playwright_available():
-                self.state = InstallState.FAILED
-                self.last_error = ("playwright 包没装。请检查插件的 requirements.txt "
-                                   "是否安装成功（pip install playwright）")
-                logger.error("自动安装浏览器失败：%s", self.last_error)
-                return None
+                return self._fail(
+                    "playwright 包没装。请检查插件的 requirements.txt "
+                    "是否安装成功（pip install playwright）")
             return await self._run_install()
 
     async def _run_install(self) -> str | None:
@@ -272,31 +371,56 @@ class BrowserInstaller:
         self.last_error = ""
         self.missing_libs = []
         self.install_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_completion_marker()
 
-        # --- 第 1 步：下载浏览器（不带 --with-deps，保证这步不受 apt 影响）---
-        logger.info("开始下载 Chromium 到 %s，约 170MB", self.install_dir)
         try:
+            # --- 第 1 步：下载浏览器（不带 --with-deps，保证这步不受 apt 影响）---
+            logger.info("开始下载 Chromium 到 %s，约 170MB",
+                        path_for_log(self.install_dir))
             code, tail = await self._spawn(
                 [sys.executable, "-m", "playwright", "install", "chromium"],
                 self._env())
         except asyncio.TimeoutError:
             return self._fail(f"下载超时（超过 {self.timeout:.0f} 秒）")
+        except asyncio.CancelledError:
+            self._cancel()
+            raise
         except Exception as exc:  # noqa: BLE001
-            return self._fail(f"{type(exc).__name__}: {exc}")
+            logger.error("下载浏览器时出现异常: %s", exception_for_log(exc))
+            return self._fail(f"下载过程异常：{type(exc).__name__}")
 
-        path = self.installed_path()
+        if code != 0:
+            if tail:
+                logger.debug("浏览器下载输出末尾: %s",
+                             sanitize_log_text(tail[-300:]))
+            return self._fail(f"下载浏览器失败（退出码 {code}）")
+        path = find_current_chromium_in(self.install_dir)
         if not path:
-            return self._fail(
-                f"下载浏览器失败（退出码 {code}）"
-                + (f"；输出末尾: {tail[-300:]}" if tail else ""))
-        logger.info("Chromium 下载完成: %s", path)
+            if tail:
+                logger.debug("浏览器下载输出末尾: %s",
+                             sanitize_log_text(tail[-300:]))
+            return self._fail("下载命令成功退出，但没有找到完整的浏览器")
+        logger.info("Chromium 下载完成: %s", path_for_log(path))
 
         # --- 第 2 步：补系统依赖（失败不致命，浏览器已经在了）---
-        if self.with_deps:
-            await self._ensure_system_deps()
+        try:
+            if self.with_deps:
+                await self._ensure_system_deps()
+        except asyncio.CancelledError:
+            self._cancel()
+            raise
 
         self.finished_at = time.monotonic()
-        self.missing_libs = missing_system_libs()
+        try:
+            self.missing_libs = await asyncio.to_thread(missing_system_libs)
+        except asyncio.CancelledError:
+            self._cancel()
+            raise
+        try:
+            self._write_completion_marker(path)
+        except OSError as exc:
+            return self._fail(
+                f"浏览器已下载，但无法写入安装完成标记: {type(exc).__name__}")
         self.state = InstallState.DONE
         if self.missing_libs:
             logger.warning(
@@ -307,11 +431,49 @@ class BrowserInstaller:
             logger.info("浏览器和系统依赖都已就绪（耗时 %.0f 秒）", self.elapsed)
         return path
 
+    def _mark_existing(self) -> None:
+        """把磁盘上已完整安装的浏览器反映到当前状态对象。"""
+        if self.state is InstallState.DONE:
+            return
+        now = time.monotonic()
+        self.state = InstallState.DONE
+        self.started_at = now
+        self.finished_at = now
+        self.last_error = ""
+
+    def _cancel(self) -> None:
+        self.state = InstallState.CANCELLED
+        self.finished_at = time.monotonic()
+        self.last_error = "安装任务被取消"
+        logger.info("浏览器自动安装已取消")
+
+    def _clear_completion_marker(self) -> None:
+        with contextlib.suppress(OSError):
+            (self.install_dir / _MANAGED_COMPLETE_NAME).unlink()
+
+    def _write_completion_marker(self, executable: str) -> None:
+        revision = playwright_chromium_revision()
+        if revision is None:
+            raise OSError("无法读取 Playwright Chromium revision")
+        relative = pathlib.Path(executable).relative_to(self.install_dir).as_posix()
+        marker = self.install_dir / _MANAGED_COMPLETE_NAME
+        temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps({
+                "revision": revision,
+                "executable": relative,
+            }), encoding="utf-8")
+            os.replace(temporary, marker)
+        except OSError:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise
+
     def _fail(self, reason: str) -> None:
         self.state = InstallState.FAILED
         self.finished_at = time.monotonic()
-        self.last_error = reason
-        logger.error("自动安装浏览器失败: %s", reason)
+        self.last_error = sanitize_log_text(reason)
+        logger.error("自动安装浏览器失败: %s", self.last_error)
         return None
 
     def _env(self) -> dict[str, str]:
@@ -325,7 +487,7 @@ class BrowserInstaller:
     # -- 系统依赖 ----------------------------------------------------------
     async def _ensure_system_deps(self) -> None:
         """尽力补齐 Chromium 的系统依赖库，失败只告警。"""
-        missing = missing_system_libs()
+        missing = await asyncio.to_thread(missing_system_libs)
         if not missing:
             logger.debug("系统依赖库齐全，跳过安装")
             return
@@ -347,7 +509,7 @@ class BrowserInstaller:
                 self._env(), timeout=min(self.timeout, 900))
         except Exception as exc:  # noqa: BLE001
             code, tail = -1, f"{type(exc).__name__}: {exc}"
-        if code == 0 and not missing_system_libs():
+        if code == 0 and not await asyncio.to_thread(missing_system_libs):
             logger.info("系统依赖库安装完成（playwright install-deps）")
             return
 
@@ -357,7 +519,8 @@ class BrowserInstaller:
                        "改用自选依赖清单重试。原因通常是官方列表里含本发行版"
                        "没有的包（如 ttf-unifont / ttf-ubuntu-font-family）", code)
         if tail:
-            logger.debug("install-deps 输出末尾: %s", tail[-400:])
+            logger.debug("install-deps 输出末尾: %s",
+                         sanitize_log_text(tail[-400:]))
         await self._apt_install_libs()
 
     async def _apt_install_libs(self) -> None:
@@ -370,7 +533,8 @@ class BrowserInstaller:
             await self._spawn(["apt-get", "update"], self._env(),
                               timeout=min(self.timeout, 600))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("apt-get update 失败，继续尝试安装: %s", exc)
+            logger.warning("apt-get update 失败，继续尝试安装: %s",
+                           exception_for_log(exc))
 
         available = await self._pick_available_packages()
         if not available:
@@ -384,13 +548,13 @@ class BrowserInstaller:
                  *available],
                 self._env(), timeout=min(self.timeout, 900))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("apt-get install 出错: %s", exc)
+            logger.warning("apt-get install 出错: %s", exception_for_log(exc))
             return
         if code == 0:
             logger.info("系统依赖库安装完成（自选清单）")
         else:
             logger.warning("apt-get install 退出码 %s；输出末尾: %s",
-                           code, (tail or "")[-300:])
+                           code, sanitize_log_text((tail or "")[-300:]))
 
     async def _pick_available_packages(self) -> list[str]:
         """对每组候选包名，挑出 apt 里真的有的那个。"""
@@ -404,24 +568,31 @@ class BrowserInstaller:
 
     async def _apt_has_candidate(self, package: str) -> bool:
         try:
-            process = await asyncio.create_subprocess_exec(
-                "apt-cache", "policy", package,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL, env=self._env())
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+            code, output = await self._spawn(
+                ["apt-cache", "policy", package], self._env(), timeout=30)
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001
             return False
-        text = stdout.decode("utf-8", "replace")
-        match = re.search(r"Candidate:\s*(\S+)", text)
-        return bool(match and match.group(1) != "(none)")
+        match = re.search(r"Candidate:\s*(\S+)", output)
+        return bool(code == 0 and match and match.group(1) != "(none)")
 
     async def _spawn(self, command: list[str], env: dict[str, str],
-                     timeout: float | None = None) -> tuple[int | None, str]:
+                     timeout: float | None = None) -> tuple[int, str]:
         """跑一条命令，把关键输出转到日志，返回 (退出码, 输出末尾)。"""
-        logger.debug("执行: %s", " ".join(command))
+        display_command = [pathlib.Path(command[0]).name, *command[1:]]
+        logger.debug("执行: %s",
+                     sanitize_log_text(" ".join(display_command)))
+        process_kwargs: dict[str, object] = {}
+        if os.name == "nt":
+            process_kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            process_kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, env=env)
+            stderr=asyncio.subprocess.STDOUT, env=env, **process_kwargs)
 
         lines: list[str] = []
 
@@ -440,14 +611,87 @@ class BrowserInstaller:
                 # 下载进度刷屏，只挑关键行记日志
                 if re.search(r"(Downloading|Installing|error|failed|Error|E:)",
                              line):
-                    logger.info("playwright install: %s", line[:200])
+                    logger.info("playwright install: %s",
+                                sanitize_log_text(line[:200]))
 
+        drain_task = asyncio.create_task(drain())
         try:
             await asyncio.wait_for(
-                asyncio.gather(drain(), process.wait()),
-                timeout=timeout if timeout is not None else self.timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            with contextlib.suppress(Exception):
-                process.kill()
+                asyncio.gather(process.wait(), drain_task),
+                timeout=timeout if timeout is not None else self.timeout,
+            )
+        except BaseException:
+            # 进程树回收必须脱离当前安装 task。插件卸载有自己的等待上限，
+            # 到期时可能再次取消安装 task；若清理仍在同一个 task 中，第二次
+            # 取消会把 taskkill/SIGKILL 流程截断并留下下载器或 apt 子进程。
+            cleanup = asyncio.create_task(
+                self._cleanup_spawn(process, drain_task))
+            self._cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._cleanup_finished)
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # 清理任务由集合强引用，当前调用者可以按自己的截止时间退出。
+                pass
+            except Exception:
+                # 回调会记录清理异常；这里必须保留原始超时/取消分类。
+                pass
             raise
+        assert process.returncode is not None
         return process.returncode, "\n".join(lines)
+
+    async def _cleanup_spawn(
+        self,
+        process: asyncio.subprocess.Process,
+        drain_task: asyncio.Task[None],
+    ) -> None:
+        try:
+            await self._terminate_process_tree(process)
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+
+    def _cleanup_finished(self, task: asyncio.Task[None]) -> None:
+        self._cleanup_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("安装子进程后台清理失败: %s",
+                           exception_for_log(error))
+
+    async def _terminate_process_tree(
+            self, process: asyncio.subprocess.Process) -> None:
+        """结束安装命令及其下载器/apt 子进程，等待系统完成回收。"""
+        if os.name == "nt":
+            def taskkill() -> None:
+                subprocess.run(  # noqa: S603
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(taskkill)
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGTERM)
+
+        if process.returncode is None:
+            with contextlib.suppress(
+                asyncio.TimeoutError, ProcessLookupError
+            ):
+                await asyncio.wait_for(process.wait(), timeout=5)
+
+        if os.name != "nt":
+            # 父进程退出不代表同一进程组里的下载器/apt 后代也已退出。
+            # 无论父进程状态如何都补一次 SIGKILL，确保继承 stdout 的后代
+            # 不会在插件卸载后继续运行。
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=5)

@@ -7,6 +7,10 @@ class ImageSearchError(Exception):
     """本模块所有异常的基类。"""
 
 
+class ImageInputError(ImageSearchError):
+    """图片输入不合法；异常文字由 loader 生成，可经脱敏后展示给用户。"""
+
+
 class UploadError(ImageSearchError):
     """图片上传到 Google Lens 失败。"""
 
@@ -25,3 +29,11 @@ class ParseError(ImageSearchError):
 
 class BrowserNotAvailableError(ImageSearchError):
     """需要 Playwright 但环境不可用。"""
+
+
+class SearchBusyError(ImageSearchError):
+    """搜索执行槽和有限等待队列都已占满。"""
+
+
+class SearchTimeoutError(TimeoutError):
+    """请求取得执行权后超过配置的总时限。"""

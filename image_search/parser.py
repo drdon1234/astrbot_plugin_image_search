@@ -226,6 +226,14 @@ class RawMatch:
         )
 
 
+def candidate_limit(max_results: int) -> int:
+    """返回页面采集候选数，给后续链接还原留出适度失败余量。"""
+    requested = max(0, int(max_results))
+    if requested == 0:
+        return 0
+    return requested + min(8, max(2, (requested + 1) // 2))
+
+
 def _to_int(text: str) -> int | None:
     try:
         return int(text.replace(",", "").replace("，", ""))
@@ -463,7 +471,12 @@ def ai_html_to_text(html: str, max_chars: int = 900) -> str:
 def extract_items(payload: dict[str, Any], max_results: int = 20) -> list[RawMatch]:
     """把页面脚本的返回值整理成 :class:`RawMatch` 列表。"""
     results: list[RawMatch] = []
-    for item in payload.get("items") or []:
+    items = payload.get("items")
+    if not isinstance(items, list) or max_results <= 0:
+        return results
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         url = item.get("url")
         goto = item.get("goto")
         if not url and not goto:

@@ -14,6 +14,7 @@ import asyncio
 import re
 
 from .config import SearchConfig
+from .http_client import fetch_limited
 from .logger import logger, quiet_http_logs
 from .models import ExactMatch
 
@@ -62,7 +63,6 @@ async def complete_titles(matches: list[ExactMatch], config: SearchConfig,
 
     import httpx
 
-    quiet_http_logs()
     semaphore = asyncio.Semaphore(concurrency)
     headers = {
         "User-Agent": config.user_agent,
@@ -70,26 +70,39 @@ async def complete_titles(matches: list[ExactMatch], config: SearchConfig,
         "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     }
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                 proxy=config.proxy, headers=headers) as client:
-        async def fetch(match: ExactMatch) -> bool:
-            async with semaphore:
-                try:
-                    resp = await client.get(match.url)
-                    if resp.status_code != 200:
+    with quiet_http_logs():
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            proxy=config.proxy,
+            headers=headers,
+        ) as client:
+            async def fetch(match: ExactMatch) -> bool:
+                async with semaphore:
+                    try:
+                        response = await fetch_limited(
+                            client,
+                            match.url,
+                            max_bytes=_MAX_BYTES,
+                            truncate=True,
+                            total_timeout_seconds=timeout,
+                        )
+                        if response.status_code != 200:
+                            return False
+                        html = response.content.decode(
+                            response.encoding, errors="replace"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("补全标题失败: %s", type(exc).__name__)
                         return False
-                    html = resp.text[:_MAX_BYTES]
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("补全标题失败 %s: %s", match.url[:60], exc)
+                title = extract_title(html)
+                if not title:
                     return False
-            title = extract_title(html)
-            if not title:
+                prefix = truncated_prefix(match.content)
+                if prefix and title.startswith(prefix) and len(title) > len(prefix):
+                    match.content = title
+                    return True
                 return False
-            prefix = truncated_prefix(match.content)
-            if prefix and title.startswith(prefix) and len(title) > len(prefix):
-                match.content = title
-                return True
-            return False
 
-        results = await asyncio.gather(*(fetch(m) for m in targets))
+            results = await asyncio.gather(*(fetch(m) for m in targets))
     return sum(results)

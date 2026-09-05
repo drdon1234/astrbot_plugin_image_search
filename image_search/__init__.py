@@ -7,7 +7,7 @@
 
     async def main():
         async with GoogleLensSearcher(SearchConfig()) as searcher:
-            result = await searcher.search("test_imgs/test.png")
+            result = await searcher.search("/path/to/image.png")
             for match in result.exact_matches:
                 print(match.url, match.content)
 
@@ -21,9 +21,12 @@ from .config import SearchConfig
 from .exceptions import (
     BrowserNotAvailableError,
     FetchError,
+    ImageInputError,
     ImageSearchError,
     ParseError,
     RateLimitedError,
+    SearchBusyError,
+    SearchTimeoutError,
     UploadError,
 )
 from .formatter import OutputOptions, format_match, format_result
@@ -39,6 +42,7 @@ __all__ = [
     "ExactMatch",
     "FetchError",
     "GoogleLensSearcher",
+    "ImageInputError",
     "ImageSearchError",
     "LensSearchResult",
     "LensSearchService",
@@ -48,7 +52,9 @@ __all__ = [
     "PluginConfig",
     "PluginOptions",
     "RateLimitedError",
+    "SearchBusyError",
     "SearchConfig",
+    "SearchTimeoutError",
     "UploadError",
     "build_config",
     "format_match",
@@ -57,4 +63,4 @@ __all__ = [
     "search_image",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
