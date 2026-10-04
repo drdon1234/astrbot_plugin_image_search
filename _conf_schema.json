@@ -143,6 +143,15 @@
                 "hint": "把结果打包成一条合并转发，点开才看到内容，不占聊天记录。关闭后按块逐条发送普通消息。搜图结果由插件直接投递，不受 AstrBot 全局设置里「转发消息的字数阈值」和「回复时引用发送人消息」的影响——否则结果会因为字数偶尔越过阈值而时折叠时不折叠。",
                 "default": true
             },
+            "forward_with_image": {
+                "description": "合并转发首个节点附原图",
+                "type": "bool",
+                "hint": "在合并转发的最前面加一个节点放用户发来的原图，点开转发就能对照着看结果，不用再翻回去找是哪张图。仅在开启「使用合并转发消息」时生效；回退为普通消息时不附图。",
+                "condition": {
+                    "use_forward_message": true
+                },
+                "default": false
+            },
             "merge_ai_and_exact": {
                 "description": "合并图片描述与完全匹配",
                 "type": "bool",

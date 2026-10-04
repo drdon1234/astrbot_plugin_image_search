@@ -39,6 +39,8 @@ class OutputOptions:
             所以 :func:`format_blocks` 里要求 ``use_forward_message`` 同时为真。
             这个模式下每条结果占三块：序号头、``标题（来源）``、裸链接。
             序号头由 ``index_label`` 定义，同时充当结果之间的分隔。
+        forward_with_image: 是否在合并转发的第一个节点放用户发来的原图。
+            只在合并转发下生效，由调用方负责插入图片节点，这里只携带开关。
         merge_ai_and_exact: 是否把 AI 描述和完全匹配合并进同一个块。
             和 ``use_forward_message`` 无关，两者可以任意组合。
         index_label: 拆分模式下每条结果的序号头，``{index}`` 会替换成序号。
@@ -57,6 +59,7 @@ class OutputOptions:
     expect_exact_matches: bool = True
     use_forward_message: bool = True
     link_as_separate_message: bool = False
+    forward_with_image: bool = False
     merge_ai_and_exact: bool = False
     index_label: str = "[ 结果{index} ]"
 

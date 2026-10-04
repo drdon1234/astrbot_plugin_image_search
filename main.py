@@ -247,19 +247,27 @@ class ImageSearchPlugin(Star):
             if isinstance(outcome, str):
                 await event.send(event.plain_result(outcome))
                 return
-            await self._send_result(event, outcome)
+            await self._send_result(event, outcome, payload)
         finally:
             self._finish_user_request(
                 request_key, start_cooldown=start_cooldown)
 
     async def _send_result(self, event: AstrMessageEvent,
-                           result: LensSearchResult) -> None:
-        """按配置把结果发出去：一条合并转发，或者逐块发普通消息。"""
+                           result: LensSearchResult,
+                           image_path: str | None = None) -> None:
+        """按配置把结果发出去：一条合并转发，或者逐块发普通消息。
+
+        开启 ``forward_with_image`` 时，合并转发的第一个节点放原图，方便对照。
+        回退成普通消息时不附图——再把原图发一遍只会刷屏。
+        """
         blocks = format_blocks(result, self.config.output)
         if self.config.output.use_forward_message:
             name, uin = self._forward_identity(event)
             nodes = [Node(name=name, uin=uin, content=[Plain(block)])
                      for block in blocks]
+            if self.config.output.forward_with_image and image_path:
+                nodes.insert(0, Node(name=name, uin=uin,
+                                     content=[Image.fromFileSystem(image_path)]))
             try:
                 await event.send(event.chain_result([Nodes(nodes)]))
                 return
@@ -484,6 +492,7 @@ class ImageSearchPlugin(Star):
             f"自动安装: {'开' if self.config.search.auto_install_browser else '关'}",
             f"合并转发: {'开' if output.use_forward_message else '关'}",
             f"链接单独成条: {'开' if output.link_as_separate_message else '关'}",
+            f"　首节点附原图: {'开' if output.forward_with_image else '关'}",
             f"　描述与结果合并: {'开' if output.merge_ai_and_exact else '关'}",
         ]
         if not ready:

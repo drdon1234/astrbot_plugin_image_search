@@ -142,6 +142,7 @@ def build_config(raw: Mapping[str, Any] | None,
         use_forward_message=_bool(output_raw.get("use_forward_message"), True),
         link_as_separate_message=_bool(
             output_raw.get("link_as_separate_message"), False),
+        forward_with_image=_bool(output_raw.get("forward_with_image"), False),
         merge_ai_and_exact=_bool(output_raw.get("merge_ai_and_exact"), False),
     )
 

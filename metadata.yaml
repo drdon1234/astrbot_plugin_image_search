@@ -1,6 +1,6 @@
 name: astrbot_plugin_image_search
 desc: 基于 Google Lens 反向搜图，返回 AI 图片描述与完全匹配来源链接
-version: 0.2.0
+version: 0.2.1
 astrbot_version: ">=4.27,<5"
 author: drdon1234
 repo: https://github.com/drdon1234/astrbot_plugin_image_search
