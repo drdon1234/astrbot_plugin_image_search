@@ -1,16 +1,18 @@
 # 核心依赖
-httpx==0.28.1
+# 用到了 AsyncClient(proxy=...)，这个参数从 0.26 起才有。
+httpx>=0.26,<1
 # playwright 的版本决定了自动下载的浏览器版本，这一点很关键：
 # 实测在同一出口 IP、其他条件完全相同的交替对比下，
 # Chromium 131（playwright 1.49 自带）0/5 通过，
 # Chrome for Testing 151（playwright 1.62 自带）5/5 通过 ——
 # Google 会把过旧的浏览器当可疑客户端拦掉。升级本项时要一并确认浏览器版本够新。
-playwright==1.62.0
+# 下限按上面的实测锁在 1.62，不要放低。
+playwright>=1.62,<2
 
 # 动图（GIF / 动态 WebP / APNG）抽第一帧用。抽帧的收益是减小上传体积并固定
 # 搜索内容；实测原样上传与抽帧的命中结果一致。
-pillow==12.2.0
+pillow>=10,<13
 
 # 解析 AI 模式回答的 HTML 片段。按 DOM 结构还原成纯文本（标题、列表、表格），
 # 不靠正则猜测措辞 —— 详见 docs/DESIGN_NOTES.md 2.10。
-beautifulsoup4==4.14.2
+beautifulsoup4>=4.12,<5
